@@ -4,24 +4,25 @@
 #include <Arduino.h>
 
 // ==========================================
-// PIN DEFINITIONS (ESP32-S3 N8R16)
+// PIN DEFINITIONS
 // ==========================================
-// Pin Sensor AICHI (NPN Open Collector)
-// Hubungkan kabel Putih/Signal ke GPIO 4 dengan Pull-up resistor 4.7k-10k ke 3.3V
+#if defined(CONFIG_IDF_TARGET_ESP32C3) || defined(ARDUINO_ESP32C3_DEV)
+// Pinout ESP32-C3 Super Mini (13-pin ultra compact)
+#define SENSOR_PIN              4  // Signal Pulsa AICHI (Pull-up 4.7k-10k ke 3.3V)
+#define LED_FLOW_PIN            8  // Built-in Blue LED ESP32-C3 Super Mini
+#define RELAY_VALVE_PIN         6  // Relay Selenoid Valve
+#define BUZZER_PIN              7  // Buzzer Alarm
+#define I2C_SDA_PIN             2  // I2C SDA (OLED/LCD)
+#define I2C_SCL_PIN             3  // I2C SCL (OLED/LCD)
+#else
+// Pinout ESP32-S3 DevKitC-1 (N8R16)
 #define SENSOR_PIN              4
-
-// Indikator LED (Blink saat cairan mengalir)
 #define LED_FLOW_PIN            2
-
-// Pin Relay Selenoid Valve (Auto Cut-off Pompa / Valve Pengisian)
 #define RELAY_VALVE_PIN         6
-
-// Pin Buzzer Alarm (Buzzer aktif 5V untuk notifikasi cut-off otomatis)
 #define BUZZER_PIN              7
-
-// Pin I2C Display (Opsional LCD 16x2 / OLED SSD1306)
 #define I2C_SDA_PIN             8
 #define I2C_SCL_PIN             9
+#endif
 
 // ==========================================
 // SENSOR AICHI 1/2" SPECIFICATIONS
