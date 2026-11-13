@@ -716,11 +716,69 @@ void handleTimeSync() {
     if (epoch > 1700000000) {
         struct timeval tv = { (time_t)epoch, 0 };
         settimeofday(&tv, NULL);
-        Serial.printf("[TIME] Jam RTC berhasil disinkronkan dari browser: %s\n", getFormattedCurrentTime().c_str());
+        todayDateStr = getCurrentDateString();
+        Serial.printf("[TIME] Jam RTC berhasil disinkronkan dari browser: %s (%s)\n", getFormattedCurrentTime().c_str(), todayDateStr.c_str());
         server.send(200, "application/json", "{\"status\":\"ok\",\"time\": \"" + getFormattedCurrentTime() + "\"}");
     } else {
         server.send(400, "application/json", "{\"error\":\"Timestamp epoch tidak valid\"}");
     }
+}
+
+// Backup Konfigurasi (JSON Export)
+void handleConfigBackup() {
+    JsonDocument doc;
+    doc["k_factor"] = kFactor;
+    doc["price_per_liter"] = pricePerLiter;
+    doc["fluid_name"] = fluidName;
+    doc["unit_name"] = unitName;
+    doc["currency"] = currencySymbol;
+    doc["active_fluid_id"] = activeFluidId;
+    doc["overshoot_liters"] = overshootLiters;
+    doc["webhook_url"] = webhookUrl;
+    doc["sta_ssid"] = staSsid;
+    doc["mp_enabled"] = multiPointCalibEnabled;
+    doc["k_low"] = kLow;
+    doc["k_mid"] = kMid;
+    doc["k_high"] = kHigh;
+    doc["backup_time"] = getFormattedCurrentTime();
+
+    String out;
+    serializeJsonPretty(doc, out);
+    server.sendHeader("Content-Disposition", "attachment; filename=\"flowmeter_backup_config.json\"");
+    server.send(200, "application/json", out);
+}
+
+// Restore Konfigurasi (JSON Import)
+void handleConfigRestore() {
+    if (!server.hasArg("plain")) {
+        server.send(400, "application/json", "{\"error\":\"Payload backup kosong!\"}");
+        return;
+    }
+    JsonDocument doc;
+    deserializeJson(doc, server.arg("plain"));
+    String pin = doc["pin"] | "";
+    if (pin != adminPin) {
+        server.send(403, "application/json", "{\"error\":\"PIN Admin salah!\"}");
+        return;
+    }
+
+    if (doc["k_factor"].is<float>()) kFactor = doc["k_factor"].as<float>();
+    if (doc["price_per_liter"].is<float>()) pricePerLiter = doc["price_per_liter"].as<float>();
+    if (doc["fluid_name"].is<String>()) fluidName = doc["fluid_name"].as<String>();
+    if (doc["unit_name"].is<String>()) unitName = doc["unit_name"].as<String>();
+    if (doc["currency"].is<String>()) currencySymbol = doc["currency"].as<String>();
+    if (doc["active_fluid_id"].is<String>()) activeFluidId = doc["active_fluid_id"].as<String>();
+    if (doc["overshoot_liters"].is<float>()) overshootLiters = doc["overshoot_liters"].as<float>();
+    if (doc["webhook_url"].is<String>()) webhookUrl = doc["webhook_url"].as<String>();
+    if (doc["sta_ssid"].is<String>()) staSsid = doc["sta_ssid"].as<String>();
+    if (doc["mp_enabled"].is<bool>()) multiPointCalibEnabled = doc["mp_enabled"].as<bool>();
+    if (doc["k_low"].is<float>()) kLow = doc["k_low"].as<float>();
+    if (doc["k_mid"].is<float>()) kMid = doc["k_mid"].as<float>();
+    if (doc["k_high"].is<float>()) kHigh = doc["k_high"].as<float>();
+
+    saveConfigToNVS();
+    beepBuzzer(150, 2);
+    server.send(200, "application/json", "{\"status\":\"ok\",\"message\":\"Konfigurasi berhasil dipulihkan (restored)!\"}");
 }
 
 // Clear Safety Alarms
@@ -909,6 +967,8 @@ void setup() {
     server.on("/api/history/export", HTTP_GET, handleExportHistoryCsv);
     server.on("/api/history/clear", HTTP_POST, handleClearHistory);
     server.on("/api/wifi/settings", HTTP_POST, handleWifiSettings);
+    server.on("/api/config/backup", HTTP_GET, handleConfigBackup);
+    server.on("/api/config/restore", HTTP_POST, handleConfigRestore);
 
     // Web OTA Firmware Update via Browser
     server.on("/update", HTTP_POST, []() {

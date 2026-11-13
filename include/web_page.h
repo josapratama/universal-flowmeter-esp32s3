@@ -545,6 +545,52 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
       .receipt-box { position: absolute; left: 0; top: 0; width: 100%; max-width: 320px; box-shadow: none; padding: 5px; }
       .receipt-actions { display: none !important; }
     }
+
+    /* High-Contrast Outdoor Sunlight Mode */
+    body.sunlight {
+      --bg: #f1f5f9;
+      --card-bg: #ffffff;
+      --card-border: #94a3b8;
+      --text: #0f172a;
+      --text-muted: #334155;
+      --disp-bg: #e2e8f0;
+    }
+    body.sunlight .dispenser-display {
+      border: 3px solid #0f172a;
+      box-shadow: 0 4px 14px rgba(0,0,0,0.15);
+    }
+    body.sunlight .disp-value {
+      color: #0369a1;
+      text-shadow: none;
+    }
+    body.sunlight .disp-cost {
+      color: #b45309;
+      text-shadow: none;
+    }
+    body.sunlight .stat-box, body.sunlight .summary-card {
+      background: #ffffff;
+      border: 1px solid #94a3b8;
+    }
+    body.sunlight .stat-val {
+      color: #0f172a !important;
+    }
+    body.sunlight table th {
+      background: #e2e8f0;
+      color: #0f172a;
+    }
+    body.sunlight table td {
+      border-bottom-color: #cbd5e1;
+    }
+    body.sunlight .btn-secondary {
+      background: #e2e8f0;
+      color: #0f172a;
+      border-color: #94a3b8;
+    }
+    body.sunlight .badge {
+      border-color: #94a3b8 !important;
+      color: #0f172a !important;
+      background: #e2e8f0 !important;
+    }
     
     footer { text-align: center; font-size: 0.72rem; color: #64748b; padding: 14px 0; }
   </style>
@@ -561,6 +607,9 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
         </div>
       </div>
       <div class="header-badges">
+        <button class="btn-secondary" id="btnSound" style="padding:4px 8px;font-size:0.72rem;background:#0b1120;border-color:#334155;" onclick="toggleSound()">🔊 Suara</button>
+        <button class="btn-secondary" id="btnSunlight" style="padding:4px 8px;font-size:0.72rem;background:#0b1120;border-color:#334155;" onclick="toggleSunlight()">☀️ Terang</button>
+        <button class="btn-secondary" id="btnKiosk" style="padding:4px 8px;font-size:0.72rem;background:#0b1120;border-color:#334155;" onclick="toggleKiosk()">⛶ Kiosk</button>
         <div class="badge badge-valve-closed" id="valveStatusBadge">
           <span style="font-size:10px;">●</span> <span id="valveStatusText">VALVE TERTUTUP</span>
         </div>
@@ -607,6 +656,12 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
         <div style="text-align:right;">
           <span class="disp-cost" id="batchCost">Rp 0</span>
         </div>
+      </div>
+
+      <!-- Realtime Dispense Countdown & ETA Badge -->
+      <div id="dispEtaRow" style="display:none;background:rgba(14,165,233,0.12);border:1px solid rgba(14,165,233,0.3);border-radius:10px;padding:8px 12px;justify-content:space-between;align-items:center;">
+        <span style="font-size:0.75rem;font-weight:700;color:#38bdf8;display:flex;align-items:center;gap:6px;">⏱️ ESTIMASI SISA WAKTU</span>
+        <span id="dispEtaValue" style="font-size:0.88rem;font-weight:900;color:#38bdf8;font-family:monospace;">Menghitung...</span>
       </div>
 
       <!-- Realtime Flow Wave Animation -->
@@ -970,6 +1025,21 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
               🕒 Sinkronkan Jam Ponsel ke ESP32
             </button>
           </div>
+
+          <hr style="border:none;border-top:1px dashed #334155;margin:18px 0;" />
+          <h4 style="font-size:0.95rem;color:#38bdf8;margin-bottom:6px;">💾 Backup & Restore Konfigurasi (.json)</h4>
+          <p style="font-size:0.8rem;color:var(--text-muted);margin-bottom:12px;">
+            Simpan salinan cadangan parameter kalibrasi, harga, WiFi, dan profil cairan ke file JSON di komputer / HP Anda, atau pulihkan kembali dengan 1 klik.
+          </p>
+          <div style="display:flex;gap:10px;flex-wrap:wrap;align-items:center;">
+            <a href="/api/config/backup" class="btn-secondary" style="text-decoration:none;display:inline-flex;align-items:center;gap:6px;padding:10px 14px;">
+              📥 Download Backup (.json)
+            </a>
+            <label class="btn-secondary" style="cursor:pointer;display:inline-flex;align-items:center;gap:6px;padding:10px 14px;color:#10b981;border-color:rgba(16,185,129,0.4);">
+              📤 Restore Konfigurasi (.json)
+              <input type="file" id="cfgRestoreInput" accept=".json" style="display:none;" onchange="handleRestoreConfigFile(event)">
+            </label>
+          </div>
         </div>
       </div>
 
@@ -1059,6 +1129,91 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
     let initialTimeSynced = false;
     let settingsFormInitialized = false;
     let latestData = {};
+    let soundEnabled = true;
+    let audioCtx = null;
+    let prevDispensing = false;
+    let prevAlarm = false;
+
+    function getAudioContext() {
+      if (!audioCtx) {
+        audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+      }
+      if (audioCtx.state === 'suspended') {
+        audioCtx.resume();
+      }
+      return audioCtx;
+    }
+
+    function playTone(freq, type, duration, count = 1, interval = 120) {
+      if (!soundEnabled) return;
+      try {
+        const ctx = getAudioContext();
+        for (let i = 0; i < count; i++) {
+          setTimeout(() => {
+            const osc = ctx.createOscillator();
+            const gain = ctx.createGain();
+            osc.type = type;
+            osc.frequency.setValueAtTime(freq, ctx.currentTime);
+            gain.gain.setValueAtTime(0.2, ctx.currentTime);
+            gain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + duration);
+            osc.connect(gain);
+            gain.connect(ctx.destination);
+            osc.start();
+            osc.stop(ctx.currentTime + duration);
+          }, i * interval);
+        }
+      } catch (e) {}
+    }
+
+    function playCutoffChime() {
+      if (!soundEnabled) return;
+      try {
+        const ctx = getAudioContext();
+        const notes = [523.25, 659.25, 783.99, 1046.50];
+        notes.forEach((freq, idx) => {
+          setTimeout(() => {
+            const osc = ctx.createOscillator();
+            const gain = ctx.createGain();
+            osc.type = "sine";
+            osc.frequency.setValueAtTime(freq, ctx.currentTime);
+            gain.gain.setValueAtTime(0.25, ctx.currentTime);
+            gain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + 0.35);
+            osc.connect(gain);
+            gain.connect(ctx.destination);
+            osc.start();
+            osc.stop(ctx.currentTime + 0.35);
+          }, idx * 90);
+        });
+      } catch (e) {}
+    }
+
+    function playAlarmSiren() {
+      playTone(880, "sawtooth", 0.15, 3, 160);
+    }
+
+    function toggleSound() {
+      soundEnabled = !soundEnabled;
+      const btn = document.getElementById("btnSound");
+      btn.textContent = soundEnabled ? "🔊 Suara" : "🔇 Bisu";
+      if (soundEnabled) playTone(880, "sine", 0.1);
+    }
+
+    function toggleSunlight() {
+      document.body.classList.toggle("sunlight");
+      const isSun = document.body.classList.contains("sunlight");
+      document.getElementById("btnSunlight").textContent = isSun ? "🌙 Gelap" : "☀️ Terang";
+      localStorage.setItem("flowmeter_sunlight", isSun ? "1" : "0");
+    }
+
+    function toggleKiosk() {
+      if (!document.fullscreenElement) {
+        document.documentElement.requestFullscreen().catch(()=>{});
+        document.getElementById("btnKiosk").textContent = "🗗 Keluar";
+      } else {
+        if (document.exitFullscreen) document.exitFullscreen();
+        document.getElementById("btnKiosk").textContent = "⛶ Kiosk";
+      }
+    }
 
     const PRESET_VOLUMES = [1, 2, 5, 10, 20, 50];
     const PRESET_AMOUNTS = [20000, 50000, 100000, 200000, 500000];
@@ -1240,6 +1395,20 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
         document.getElementById("clockText").textContent = d.system_time || "Standby";
         const badge = document.getElementById("valveStatusBadge");
         const badgeTxt = document.getElementById("valveStatusText");
+        const isNowDispensing = Boolean(d.valve_open || d.is_dispensing);
+
+        // Sound FX triggers: Dispense Cut-off Chime & Safety Alarm Siren
+        if (prevDispensing && !isNowDispensing && Number(d.batch_liters) >= 0.005) {
+          playCutoffChime();
+        }
+        prevDispensing = isNowDispensing;
+
+        const hasAlarm = Boolean(d.dry_run_alarm || d.leakage_alert);
+        if (!prevAlarm && hasAlarm) {
+          playAlarmSiren();
+        }
+        prevAlarm = hasAlarm;
+
         if (d.valve_open) {
           badge.className = "badge badge-valve-open";
           badgeTxt.textContent = "VALVE TERBUKA (MENGALIR)";
@@ -1251,6 +1420,38 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
           document.getElementById("btnStart").disabled = false;
           // Enable stop button if flow is active or batch volume has been dispensed (supports manual nozzle mode)
           document.getElementById("btnStop").disabled = (!d.is_dispensing && Number(d.batch_liters) <= 0.005);
+        }
+
+        // Dispense ETA & Countdown
+        const etaRow = document.getElementById("dispEtaRow");
+        const etaVal = document.getElementById("dispEtaValue");
+        if (etaRow && etaVal) {
+          if (isNowDispensing && activeMode !== "manual") {
+            const targetInputVal = parseFloat(document.getElementById("targetInput").value) || 0;
+            let targetLiters = 0;
+            if (activeMode === "volume") {
+              targetLiters = targetInputVal;
+            } else if (activeMode === "amount") {
+              const unitP = d.price_per_liter || 6800;
+              targetLiters = unitP > 0 ? (targetInputVal / unitP) : 0;
+            }
+            const remainLiters = targetLiters - Number(d.batch_liters);
+            if (remainLiters > 0.001) {
+              etaRow.style.display = "flex";
+              if (flowVal > 0.2) {
+                const totalSecRemaining = Math.max(1, Math.round((remainLiters / flowVal) * 60));
+                const mins = Math.floor(totalSecRemaining / 60);
+                const secs = totalSecRemaining % 60;
+                etaVal.textContent = `~ ${mins > 0 ? (mins + 'm ' + secs + 'd') : (secs + ' detik')} (${remainLiters.toFixed(2)} L lagi)`;
+              } else {
+                etaVal.textContent = `~ Menunggu aliran (${remainLiters.toFixed(2)} L lagi)`;
+              }
+            } else {
+              etaRow.style.display = "none";
+            }
+          } else {
+            etaRow.style.display = "none";
+          }
         }
 
         // Alarm
@@ -1611,7 +1812,42 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
       xhr.send(formData);
     }
 
+    async function handleRestoreConfigFile(event) {
+      const file = event.target.files[0];
+      if (!file) return;
+      const reader = new FileReader();
+      reader.onload = async (e) => {
+        try {
+          const json = JSON.parse(e.target.result);
+          const pin = prompt("Masukkan PIN Admin untuk konfirmasi pemulihan konfigurasi:");
+          if (!pin) return;
+          json.pin = pin;
+          const res = await fetch("/api/config/restore", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(json)
+          });
+          const d = await res.json();
+          if (d.status === "ok") {
+            alert(d.message || "Konfigurasi berhasil dipulihkan!");
+            location.reload();
+          } else {
+            alert(d.error || "Gagal memulihkan konfigurasi.");
+          }
+        } catch (err) {
+          alert("File JSON tidak valid atau rusak!");
+        }
+      };
+      reader.readAsText(file);
+      event.target.value = "";
+    }
+
     // Init
+    if (localStorage.getItem("flowmeter_sunlight") === "1") {
+      document.body.classList.add("sunlight");
+      const btnSun = document.getElementById("btnSunlight");
+      if (btnSun) btnSun.textContent = "🌙 Gelap";
+    }
     setMode("volume");
     fetchData();
     setInterval(fetchData, 400);

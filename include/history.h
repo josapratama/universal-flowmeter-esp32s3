@@ -107,6 +107,7 @@ public:
     void clear() {
         count = 0;
         nextId = 1;
+        memset(records, 0, sizeof(records));
         pref.begin("flow_hist", false);
         pref.clear();
         pref.end();
