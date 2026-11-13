@@ -12,6 +12,7 @@
 #include "config.h"
 #include "history.h"
 #include "web_page.h"
+#include "lcd_display.h"
 
 // ==========================================
 // GLOBALS & OBJECTS
@@ -20,6 +21,7 @@ WebServer server(HTTP_PORT);
 DNSServer dnsServer;
 Preferences preferences;
 TransactionHistoryManager historyManager;
+FlowMeterLcd flowLcd;
 
 // Status & Perhitungan Flow Meter
 volatile uint32_t isrPulseCount = 0;
@@ -912,6 +914,9 @@ void setup() {
     pinMode(BUZZER_PIN, OUTPUT);
     digitalWrite(BUZZER_PIN, LOW);
 
+    // Inisialisasi Layar LCD 20x4 I2C (Deteksi Otomatis 0x27 / 0x3F)
+    flowLcd.begin();
+
     // Load NVS Settings & History
     loadSettingsFromNVS();
     historyManager.begin();
@@ -1112,4 +1117,8 @@ void loop() {
             saveTotalToNVS();
         }
     }
+
+    // Update Layar LCD 20x4 I2C Secara Real-Time (Tanpa Flicker)
+    String activeDisplayIp = (staConnected && WiFi.localIP().toString() != "0.0.0.0") ? WiFi.localIP().toString() : AP_IP_ADDRESS;
+    flowLcd.update(batchLiters, batchCost, currentFlowRateLpm, valveOpen, isDispensing, fluidName, pricePerLiter, activeDisplayIp, dryRunAlarm, leakageAlert);
 }

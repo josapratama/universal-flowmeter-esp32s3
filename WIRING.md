@@ -28,9 +28,12 @@ Firmware ini mendukung deteksi target otomatis saat kompilasi (`CONFIG_IDF_TARGE
 | **Active Buzzer** | Positif (+) | **GPIO 7** | **GPIO 7** | Indikator beep & alarm keselamatan |
 | | Negatif (-) | **GND** | **GND** | Ground |
 | **LED Indikator Aliran** | Built-in / Eksternal | **GPIO 8 (Built-in Blue)** | **GPIO 2** | C3: LED biru bawaan (Aktif LOW)<br>S3: GPIO 2 via R 220Ω |
-| **I2C Display (OLED/LCD)**| SDA (Data) | **GPIO 2** | **GPIO 8** | Jalur data I2C layar eksternal |
-| | SCL (Clock) | **GPIO 3** | **GPIO 9** | Jalur clock I2C layar eksternal |
-| | VCC & GND | **3V3 & GND** | **3V3 & GND** | Daya modul layar I2C |
+| **Layar LCD 20x4 / 16x2 (I2C)**| VCC | **5V / VBUS** | **5V / VIN** | ⚠️ **Wajib 5V** agar kristal LCD menyala tajam! |
+| | GND | **GND** | **GND** | Ground bersama |
+| | SDA (Data) | **GPIO 2** | **GPIO 8** | Jalur data I2C |
+| | SCL (Clock) | **GPIO 3** | **GPIO 9** | Jalur clock I2C |
+| **(Alternatif) OLED 0.96"**| VCC & GND | **3V3 & GND** | **3V3 & GND** | Khusus OLED SSD1306 (tegangan 3.3V) |
+| | SDA & SCL | **GPIO 2 & GPIO 3** | **GPIO 8 & GPIO 9** | Jalur data & clock I2C |
 
 ---
 
@@ -180,3 +183,6 @@ Relay berfungsi sebagai saklar pemutus arus pada solenoid valve 12V/24V atau mot
 | **Angka literan melompat drastis (kebanyakan pulsa)** | Gangguan elektromagnetik (*noise EMI*) dari dinamo pompa | Jauhkan kabel sinyal sensor dari kabel daya 220V motor pompa; gunakan kabel *shielded* jika jarak > 1 meter. |
 | **Status valve terbuka tapi relay tidak menyala** | Modul relay bertipe *Active Low* | Ubah `#define RELAY_ACTIVE_LEVEL LOW` pada `include/config.h` lalu flash ulang firmware. |
 | **LED Biru SuperMini selalu menyala terang** | Polaritas LED C3 SuperMini | Built-in LED ESP32-C3 SuperMini menggunakan logika *Active Low* (katoda di GPIO 8), firmware sudah otomatis mengaturnya. |
+| **LCD 20x4 I2C layar kosong / hanya lampu biru menyala (tanpa teks)** | Potensiometer (Trimpot) kontras belum disetel | **Putar trimpot biru (potensiometer obeng min)** di bagian belakang modul ransel I2C (PCF8574) hingga karakter teks hitam/putih terlihat tajam. |
+| **LCD 20x4 teks redup atau tidak muncul sama sekali** | Tegangan VCC LCD diberi 3.3V | Layar LCD karakter HD44780 20x4 **memerlukan daya 5V** untuk polarisasi kristal cairnya. Hubungkan VCC LCD ke pin **5V / VBUS** ESP32, bukan ke 3V3! |
+| **LCD 20x4 menampilkan kotak-kotak hitam tebal penuh** | Kontras terlalu tinggi atau pin SDA/SCL tertukar | Putar balik trimpot kontras ke arah sebaliknya perlahan. Pastikan pin SDA di **GPIO 2** dan SCL di **GPIO 3** (untuk ESP32-C3). Firmware sudah dilengkapi pemindai I2C otomatis (`0x27` & `0x3F`). |

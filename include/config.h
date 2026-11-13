@@ -31,6 +31,13 @@
 #define RELAY_INACTIVE_LEVEL    LOW
 
 // ==========================================
+// I2C LCD DISPLAY CONFIGURATION (20x4 / 16x2)
+// ==========================================
+#define LCD_COLS                20
+#define LCD_ROWS                4
+#define LCD_DEFAULT_I2C_ADDR    0x27  // Alamat I2C PCF8574 default (0x27 atau 0x3F)
+
+// ==========================================
 // SENSOR AICHI 1/2" SPECIFICATIONS
 // ==========================================
 // Spesifikasi: 1 Pulsa = 2.5 mL (0.0025 Liter)
