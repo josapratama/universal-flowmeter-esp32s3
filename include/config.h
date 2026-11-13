@@ -37,6 +37,14 @@
 #define DEFAULT_CURRENCY        "Rp"
 #define DEFAULT_PRICE_PER_UNIT  6800.0f
 
+// Kalibrasi Aliran Multi-Titik (Multi-Point Calibration)
+// Mengatasi non-linearitas sensor AICHI pada debit rendah (<5 LPM) vs debit tinggi (>15 LPM)
+#define CALIB_LOW_LPM_LIMIT     5.0f
+#define CALIB_HIGH_LPM_LIMIT    15.0f
+#define DEFAULT_K_LOW           396.0f   // Aliran lambat (< 5 LPM)
+#define DEFAULT_K_MID           400.0f   // Aliran normal (5 - 15 LPM)
+#define DEFAULT_K_HIGH          404.0f   // Aliran deras (> 15 LPM)
+
 // Filter Debounce Pulsa (mikrodetik)
 // 200 us mencegah glitch / spike EMI dari motor pompa (max ~5000 Hz)
 #define PULSE_DEBOUNCE_MICROS   200
@@ -44,6 +52,28 @@
 // Inching / Overshoot Cut-off Compensation (Liter)
 // Kompensasi keterlambatan penutupan katup mekanik & cairan di selang
 #define DEFAULT_OVERSHOOT_LITERS 0.02f
+
+// ==========================================
+// PRESET BANK CAIRAN (BUILT-IN PRESETS)
+// ==========================================
+struct FluidPresetItem {
+    const char* id;
+    const char* name;
+    float price;
+    float kFactor;
+    float overshoot;
+    const char* emoji;
+};
+
+const FluidPresetItem BUILTIN_FLUIDS[] = {
+    { "biosolar",       "Bio Solar Subsidi",   6800.0f,  400.0f, 0.020f, "⛽" },
+    { "pertalite",      "Pertalite RON 90",    10000.0f, 400.0f, 0.020f, "⛽" },
+    { "pertamax",       "Pertamax RON 92",     12100.0f, 400.0f, 0.020f, "⛽" },
+    { "dexlite",        "Dexlite",             13050.0f, 400.0f, 0.020f, "⛽" },
+    { "minyak_goreng",  "Minyak Goreng Curah", 15500.0f, 396.0f, 0.035f, "🛢️" },
+    { "air_bersih",     "Air Bersih / RO",     50.0f,    400.0f, 0.010f, "💧" }
+};
+const size_t BUILTIN_FLUIDS_COUNT = sizeof(BUILTIN_FLUIDS) / sizeof(BUILTIN_FLUIDS[0]);
 
 // ==========================================
 // SAFETY & ALARM TIMEOUTS

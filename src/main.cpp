@@ -5,6 +5,7 @@
 #include <Preferences.h>
 #include <ArduinoJson.h>
 #include <HTTPClient.h>
+#include <Update.h>
 #include <time.h>
 #include <sys/time.h>
 
@@ -31,6 +32,29 @@ String fluidName = DEFAULT_FLUID_NAME;
 String unitName = DEFAULT_UNIT_NAME;
 String currencySymbol = DEFAULT_CURRENCY;
 String adminPin = DEFAULT_ADMIN_PIN;
+String activeFluidId = "biosolar";
+
+// Multi-Point Flow Calibration
+bool multiPointCalibEnabled = true;
+float kLow = DEFAULT_K_LOW;
+float kMid = DEFAULT_K_MID;
+float kHigh = DEFAULT_K_HIGH;
+
+// Rekap Shift Operator & Akumulasi Harian
+float shiftLiters = 0.0f;
+float shiftCost = 0.0f;
+uint32_t shiftTxCount = 0;
+
+float todayLiters = 0.0f;
+float todayCost = 0.0f;
+uint32_t todayTxCount = 0;
+String todayDateStr = "";
+
+// Transaksi Terakhir (untuk 1-Click Cetak Struk)
+float lastBatchLiters = 0.0f;
+float lastBatchCost = 0.0f;
+String lastBatchTimeStr = "-";
+uint32_t lastBatchId = 0;
 
 // Inching / Overshoot Compensation (Pencegah over-dispensing)
 float overshootLiters = DEFAULT_OVERSHOOT_LITERS;
@@ -121,6 +145,33 @@ String getFormattedCurrentTime() {
     return String(buf);
 }
 
+// Helper: Ambil string tanggal hari ini (YYYY-MM-DD)
+String getCurrentDateString() {
+    time_t now = time(nullptr);
+    if (now > 1700000000) {
+        struct tm timeinfo;
+        localtime_r(&now, &timeinfo);
+        char buf[16];
+        strftime(buf, sizeof(buf), "%Y-%m-%d", &timeinfo);
+        return String(buf);
+    }
+    return "OFFLINE";
+}
+
+// Helper: Kalibrasi Aliran Multi-Titik Dinamis berdasarkan Debit LPM
+float getEffectiveKFactor(float lpm) {
+    if (!multiPointCalibEnabled) return kFactor;
+    if (lpm <= CALIB_LOW_LPM_LIMIT) {
+        return kLow;
+    } else if (lpm >= CALIB_HIGH_LPM_LIMIT) {
+        return kHigh;
+    } else {
+        // Interpolasi linear halus antara titik Low (5 LPM) dan High (15 LPM)
+        float factor = (lpm - CALIB_LOW_LPM_LIMIT) / (CALIB_HIGH_LPM_LIMIT - CALIB_LOW_LPM_LIMIT);
+        return kLow + factor * (kHigh - kLow);
+    }
+}
+
 // ==========================================
 // INTERRUPT SERVICE ROUTINE (AICHI SENSOR)
 // ==========================================
@@ -145,26 +196,51 @@ void loadSettingsFromNVS() {
     unitName = preferences.getString("unit", DEFAULT_UNIT_NAME);
     currencySymbol = preferences.getString("curr", DEFAULT_CURRENCY);
     adminPin = preferences.getString("admin_pin", DEFAULT_ADMIN_PIN);
+    activeFluidId = preferences.getString("fluid_id", "biosolar");
     overshootLiters = preferences.getFloat("overshoot", DEFAULT_OVERSHOOT_LITERS);
     webhookUrl = preferences.getString("webhook", "");
     staSsid = preferences.getString("sta_ssid", "");
     staPassword = preferences.getString("sta_pass", "");
+
+    // Load Rekap Shift & Daily
+    shiftLiters = preferences.getFloat("s_liters", 0.0f);
+    shiftCost = preferences.getFloat("s_cost", 0.0f);
+    shiftTxCount = preferences.getUInt("s_count", 0);
+    todayLiters = preferences.getFloat("t_liters", 0.0f);
+    todayCost = preferences.getFloat("t_cost", 0.0f);
+    todayTxCount = preferences.getUInt("t_count", 0);
+    todayDateStr = preferences.getString("t_date", "");
+
+    // Load Multi-Point Calibration
+    multiPointCalibEnabled = preferences.getBool("mp_en", true);
+    kLow = preferences.getFloat("k_low", DEFAULT_K_LOW);
+    kMid = preferences.getFloat("k_mid", DEFAULT_K_MID);
+    kHigh = preferences.getFloat("k_high", DEFAULT_K_HIGH);
+
     preferences.end();
 
     lastSavedTotalLiters = totalLiters;
-    Serial.printf("[NVS] Data dimuat: Cairan=%s, Total=%.2f %s, K=%.3f, Harga=%s %.0f, PIN=%s, Overshoot=%.3f L\n", 
+    Serial.printf("[NVS] Data dimuat: Cairan=%s, Total=%.2f %s, K=%.3f, Harga=%s %.0f, Shift=%.2f L, PIN=%s\n", 
                   fluidName.c_str(), totalLiters, unitName.c_str(), kFactor, currencySymbol.c_str(), 
-                  pricePerLiter, adminPin.c_str(), overshootLiters);
+                  pricePerLiter, shiftLiters, adminPin.c_str());
 }
 
 void saveTotalToNVS() {
+    preferences.begin("flowmeter", false);
     if (abs(totalLiters - lastSavedTotalLiters) > 0.01) {
-        preferences.begin("flowmeter", false);
         preferences.putDouble("total_l", totalLiters);
-        preferences.end();
         lastSavedTotalLiters = totalLiters;
         Serial.printf("[NVS] Total akumulasi tersimpan: %.3f %s\n", totalLiters, unitName.c_str());
     }
+    // Simpan juga status shift & daily
+    preferences.putFloat("s_liters", shiftLiters);
+    preferences.putFloat("s_cost", shiftCost);
+    preferences.putUInt("s_count", shiftTxCount);
+    preferences.putFloat("t_liters", todayLiters);
+    preferences.putFloat("t_cost", todayCost);
+    preferences.putUInt("t_count", todayTxCount);
+    preferences.putString("t_date", todayDateStr);
+    preferences.end();
 }
 
 void saveConfigToNVS() {
@@ -175,10 +251,15 @@ void saveConfigToNVS() {
     preferences.putString("unit", unitName);
     preferences.putString("curr", currencySymbol);
     preferences.putString("admin_pin", adminPin);
+    preferences.putString("fluid_id", activeFluidId);
     preferences.putFloat("overshoot", overshootLiters);
     preferences.putString("webhook", webhookUrl);
     preferences.putString("sta_ssid", staSsid);
     preferences.putString("sta_pass", staPassword);
+    preferences.putBool("mp_en", multiPointCalibEnabled);
+    preferences.putFloat("k_low", kLow);
+    preferences.putFloat("k_mid", kMid);
+    preferences.putFloat("k_high", kHigh);
     preferences.end();
     Serial.println("[NVS] Konfigurasi profil cairan dan IoT berhasil disimpan.");
 }
@@ -228,6 +309,31 @@ void stopDispense(bool autoCutoff = false, const char* stopReason = "normal") {
         const char* modeStr = "manual";
         if (activeDispenseMode == MODE_PRESET_VOLUME) modeStr = "preset_volume";
         else if (activeDispenseMode == MODE_PRESET_AMOUNT) modeStr = "preset_amount";
+
+        // Update Rekap Shift Operator
+        shiftLiters += batchLiters;
+        shiftCost += batchCost;
+        shiftTxCount++;
+
+        // Update Akumulasi Harian (Auto reset jika ganti tanggal)
+        String todayStr = getCurrentDateString();
+        if (todayDateStr != "" && todayStr != "OFFLINE" && todayStr != todayDateStr) {
+            todayLiters = 0.0f;
+            todayCost = 0.0f;
+            todayTxCount = 0;
+        }
+        if (todayStr != "OFFLINE") {
+            todayDateStr = todayStr;
+        }
+        todayLiters += batchLiters;
+        todayCost += batchCost;
+        todayTxCount++;
+
+        // Simpan data batch terakhir untuk Cetak Struk Instan
+        lastBatchLiters = batchLiters;
+        lastBatchCost = batchCost;
+        lastBatchTimeStr = getFormattedCurrentTime();
+        lastBatchId = historyManager.getCount();
 
         // Record to History Log
         historyManager.addTransaction(
@@ -307,10 +413,116 @@ void handleApiData() {
     doc["dry_run_alarm"] = dryRunAlarm;
     doc["leakage_alert"] = leakageAlert;
     doc["webhook_url"] = webhookUrl;
+    doc["active_fluid_id"] = activeFluidId;
+
+    // Rekap Shift Operator
+    doc["shift_liters"] = shiftLiters;
+    doc["shift_cost"] = shiftCost;
+    doc["shift_tx_count"] = shiftTxCount;
+
+    // Rekap Harian
+    doc["today_liters"] = todayLiters;
+    doc["today_cost"] = todayCost;
+    doc["today_tx_count"] = todayTxCount;
+    doc["today_date"] = todayDateStr;
+
+    // Multi-Point Calibration Metrics
+    doc["mp_enabled"] = multiPointCalibEnabled;
+    doc["k_low"] = kLow;
+    doc["k_mid"] = kMid;
+    doc["k_high"] = kHigh;
+    doc["effective_k"] = getEffectiveKFactor(currentFlowRateLpm);
+
+    // Struk Instan Terakhir
+    doc["last_liters"] = lastBatchLiters;
+    doc["last_cost"] = lastBatchCost;
+    doc["last_time"] = lastBatchTimeStr;
+    doc["last_id"] = lastBatchId;
 
     String jsonResponse;
     serializeJson(doc, jsonResponse);
     server.send(200, "application/json", jsonResponse);
+}
+
+void handleResetShift() {
+    shiftLiters = 0.0f;
+    shiftCost = 0.0f;
+    shiftTxCount = 0;
+    preferences.begin("flowmeter", false);
+    preferences.putFloat("s_liters", 0.0f);
+    preferences.putFloat("s_cost", 0.0f);
+    preferences.putUInt("s_count", 0);
+    preferences.end();
+    beepBuzzer(120, 2);
+    server.send(200, "application/json", "{\"status\":\"ok\",\"message\":\"Shift operator berhasil di-reset ke 0\"}");
+}
+
+void handleFluidPreset() {
+    if (!server.hasArg("plain")) {
+        server.send(400, "application/json", "{\"error\":\"Payload kosong\"}");
+        return;
+    }
+    JsonDocument doc;
+    deserializeJson(doc, server.arg("plain"));
+    String presetId = doc["preset_id"] | "";
+
+    bool found = false;
+    for (size_t i = 0; i < BUILTIN_FLUIDS_COUNT; i++) {
+        if (presetId == BUILTIN_FLUIDS[i].id) {
+            fluidName = BUILTIN_FLUIDS[i].name;
+            pricePerLiter = BUILTIN_FLUIDS[i].price;
+            kFactor = BUILTIN_FLUIDS[i].kFactor;
+            kLow = BUILTIN_FLUIDS[i].kFactor * 0.99f;
+            kMid = BUILTIN_FLUIDS[i].kFactor;
+            kHigh = BUILTIN_FLUIDS[i].kFactor * 1.01f;
+            overshootLiters = BUILTIN_FLUIDS[i].overshoot;
+            activeFluidId = BUILTIN_FLUIDS[i].id;
+            found = true;
+            break;
+        }
+    }
+
+    if (!found) {
+        if (doc["name"].is<String>()) fluidName = doc["name"].as<String>();
+        if (doc["price"].is<float>()) pricePerLiter = doc["price"].as<float>();
+        if (doc["k_factor"].is<float>()) kFactor = doc["k_factor"].as<float>();
+        if (doc["overshoot"].is<float>()) overshootLiters = doc["overshoot"].as<float>();
+        activeFluidId = presetId;
+    }
+
+    saveConfigToNVS();
+    beepBuzzer(150, 1);
+    server.send(200, "application/json", "{\"status\":\"ok\",\"message\":\"Profil cairan berhasil diaktifkan\",\"fluid\":\"" + fluidName + "\"}");
+}
+
+void handleCalibrateMultiPoint() {
+    if (!server.hasArg("plain")) {
+        server.send(400, "application/json", "{\"error\":\"Payload kosong\"}");
+        return;
+    }
+    JsonDocument doc;
+    deserializeJson(doc, server.arg("plain"));
+    String pin = doc["pin"] | "";
+
+    if (pin != adminPin) {
+        server.send(403, "application/json", "{\"error\":\"PIN Admin salah!\"}");
+        return;
+    }
+
+    if (doc["k_low"].is<float>()) kLow = doc["k_low"].as<float>();
+    if (doc["k_mid"].is<float>()) kMid = doc["k_mid"].as<float>();
+    if (doc["k_high"].is<float>()) kHigh = doc["k_high"].as<float>();
+    if (doc["enabled"].is<bool>()) multiPointCalibEnabled = doc["enabled"].as<bool>();
+
+    preferences.begin("flowmeter", false);
+    preferences.putBool("mp_en", multiPointCalibEnabled);
+    preferences.putFloat("k_low", kLow);
+    preferences.putFloat("k_mid", kMid);
+    preferences.putFloat("k_high", kHigh);
+    preferences.end();
+
+    beepBuzzer(150, 2);
+    server.send(200, "application/json", "{\"status\":\"ok\",\"message\":\"Kalibrasi multi-titik disimpan!\"}");
 }
 
 void handleDispenseStart() {
@@ -656,6 +868,9 @@ void setup() {
     server.on("/api/dispense/stop", HTTP_POST, handleDispenseStop);
     server.on("/api/reset_batch", HTTP_POST, handleResetBatch);
     server.on("/api/reset_total", HTTP_POST, handleResetTotal);
+    server.on("/api/shift/reset", HTTP_POST, handleResetShift);
+    server.on("/api/fluid/preset", HTTP_POST, handleFluidPreset);
+    server.on("/api/calibrate/multipoint", HTTP_POST, handleCalibrateMultiPoint);
     server.on("/api/settings", HTTP_POST, handleSaveSettings);
     server.on("/api/calibrate/bejana", HTTP_POST, handleCalibrateBejana);
     server.on("/api/time/sync", HTTP_POST, handleTimeSync);
@@ -666,6 +881,37 @@ void setup() {
     server.on("/api/history/export", HTTP_GET, handleExportHistoryCsv);
     server.on("/api/history/clear", HTTP_POST, handleClearHistory);
     server.on("/api/wifi/settings", HTTP_POST, handleWifiSettings);
+
+    // Web OTA Firmware Update via Browser
+    server.on("/update", HTTP_POST, []() {
+        server.sendHeader("Connection", "close");
+        server.send(200, "application/json", Update.hasError() ? "{\"status\":\"error\",\"message\":\"Update gagal! Cek format firmware.bin\"}" : "{\"status\":\"ok\",\"message\":\"Update berhasil! ESP32 sedang restart...\"}");
+        delay(500);
+        ESP.restart();
+    }, []() {
+        HTTPUpload& upload = server.upload();
+        if (upload.status == UPLOAD_FILE_START) {
+            Serial.printf("[OTA] Update dimulai: %s\n", upload.filename.c_str());
+            if (valveOpen) {
+                valveOpen = false;
+                digitalWrite(RELAY_VALVE_PIN, LOW);
+            }
+            if (!Update.begin(UPDATE_SIZE_UNKNOWN)) {
+                Update.printError(Serial);
+            }
+        } else if (upload.status == UPLOAD_FILE_WRITE) {
+            if (Update.write(upload.buf, upload.currentSize) != upload.currentSize) {
+                Update.printError(Serial);
+            }
+        } else if (upload.status == UPLOAD_FILE_END) {
+            if (Update.end(true)) {
+                Serial.printf("[OTA] Selesai flash firmware! Ukuran: %u bytes\n", upload.totalSize);
+            } else {
+                Update.printError(Serial);
+            }
+        }
+    });
+
     server.onNotFound(handleNotFound);
 
     server.begin();
@@ -709,18 +955,19 @@ void loop() {
             }
         }
 
-        // Hitung debit aliran (Flow Rate Satuan / Menit)
-        if (isDispensing && kFactor > 0.0f) {
-            float volumeThisPeriod = (float)pulses / kFactor;
+        // Hitung debit aliran dinamis (Flow Rate Satuan / Menit)
+        float effK = getEffectiveKFactor(currentFlowRateLpm);
+        if (isDispensing && effK > 0.0f) {
+            float volumeThisPeriod = (float)pulses / effK;
             currentFlowRateLpm = (volumeThisPeriod * 60000.0f) / (float)deltaMs;
             totalLiters += (double)volumeThisPeriod;
         } else {
             currentFlowRateLpm = 0.0f;
         }
 
-        // Hitung volume batch
-        if (kFactor > 0.0f) {
-            batchLiters = (float)currentBatchPulses / kFactor;
+        // Hitung volume batch dengan kalibrasi presisi
+        if (effK > 0.0f) {
+            batchLiters = (float)currentBatchPulses / effK;
             batchCost = batchLiters * pricePerLiter;
         }
 
