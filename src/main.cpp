@@ -112,6 +112,16 @@ void beepBuzzer(uint16_t durationMs, uint8_t count = 1) {
     }
 }
 
+// Helper: Valve & LED Control (Mendukung polaritas Active-HIGH & Active-LOW)
+inline void setValve(bool open) {
+    valveOpen = open;
+    digitalWrite(RELAY_VALVE_PIN, open ? RELAY_ACTIVE_LEVEL : RELAY_INACTIVE_LEVEL);
+}
+
+inline void setFlowLed(bool on) {
+    digitalWrite(LED_FLOW_PIN, on ? LED_ACTIVE_LEVEL : !LED_ACTIVE_LEVEL);
+}
+
 // Background Task: Kirim Webhook ke Omni Agent Hub / Cloud
 void sendWebhookTask(void* pvParameters) {
     String* payload = (String*)pvParameters;
@@ -226,21 +236,20 @@ void loadSettingsFromNVS() {
 }
 
 void saveTotalToNVS() {
-    preferences.begin("flowmeter", false);
     if (abs(totalLiters - lastSavedTotalLiters) > 0.01) {
+        preferences.begin("flowmeter", false);
         preferences.putDouble("total_l", totalLiters);
+        preferences.putFloat("s_liters", shiftLiters);
+        preferences.putFloat("s_cost", shiftCost);
+        preferences.putUInt("s_count", shiftTxCount);
+        preferences.putFloat("t_liters", todayLiters);
+        preferences.putFloat("t_cost", todayCost);
+        preferences.putUInt("t_count", todayTxCount);
+        preferences.putString("t_date", todayDateStr);
+        preferences.end();
         lastSavedTotalLiters = totalLiters;
         Serial.printf("[NVS] Total akumulasi tersimpan: %.3f %s\n", totalLiters, unitName.c_str());
     }
-    // Simpan juga status shift & daily
-    preferences.putFloat("s_liters", shiftLiters);
-    preferences.putFloat("s_cost", shiftCost);
-    preferences.putUInt("s_count", shiftTxCount);
-    preferences.putFloat("t_liters", todayLiters);
-    preferences.putFloat("t_cost", todayCost);
-    preferences.putUInt("t_count", todayTxCount);
-    preferences.putString("t_date", todayDateStr);
-    preferences.end();
 }
 
 void saveConfigToNVS() {
@@ -292,8 +301,7 @@ void startDispense(DispenseMode mode, float target) {
         targetDispenseAmount = 0.0f;
     }
 
-    valveOpen = true;
-    digitalWrite(RELAY_VALVE_PIN, HIGH);
+    setValve(true);
     dispenseStartTime = millis();
     beepBuzzer(100, 1);
 
@@ -302,10 +310,12 @@ void startDispense(DispenseMode mode, float target) {
 }
 
 void stopDispense(bool autoCutoff = false, const char* stopReason = "normal") {
+    bool wasDispensing = valveOpen || (batchLiters >= 0.005f);
     if (valveOpen) {
-        valveOpen = false;
-        digitalWrite(RELAY_VALVE_PIN, LOW);
+        setValve(false);
+    }
 
+    if (wasDispensing && batchLiters >= 0.005f) {
         const char* modeStr = "manual";
         if (activeDispenseMode == MODE_PRESET_VOLUME) modeStr = "preset_volume";
         else if (activeDispenseMode == MODE_PRESET_AMOUNT) modeStr = "preset_amount";
@@ -333,7 +343,7 @@ void stopDispense(bool autoCutoff = false, const char* stopReason = "normal") {
         lastBatchLiters = batchLiters;
         lastBatchCost = batchCost;
         lastBatchTimeStr = getFormattedCurrentTime();
-        lastBatchId = historyManager.getCount();
+        lastBatchId = historyManager.getCount() + 1;
 
         // Record to History Log
         historyManager.addTransaction(
@@ -366,16 +376,18 @@ void stopDispense(bool autoCutoff = false, const char* stopReason = "normal") {
             xTaskCreate(sendWebhookTask, "WebhookTask", 4096, (void*)payloadStr, 1, NULL);
         }
 
-        if (autoCutoff) {
-            Serial.println("[DISPENSE] TARGET TERCAPAI! Auto Cut-off Solenoid Valve aktif.");
-            beepBuzzer(150, 3); // 3 beeps on auto-cutoff
-        } else if (strcmp(stopReason, "dry_run") == 0) {
-            Serial.println("[DISPENSE] DRY RUN ALARM! Pompa kosong / tidak ada aliran.");
-            beepBuzzer(500, 2);
-        } else {
-            Serial.println("[DISPENSE] Pengisian dihentikan manual / emergency stop.");
-            beepBuzzer(300, 1);
-        }
+        saveTotalToNVS();
+    }
+
+    if (autoCutoff) {
+        Serial.println("[DISPENSE] TARGET TERCAPAI! Auto Cut-off Solenoid Valve aktif.");
+        beepBuzzer(150, 3); // 3 beeps on auto-cutoff
+    } else if (strcmp(stopReason, "dry_run") == 0) {
+        Serial.println("[DISPENSE] DRY RUN ALARM! Pompa kosong / tidak ada aliran.");
+        beepBuzzer(500, 2);
+    } else if (wasDispensing) {
+        Serial.println("[DISPENSE] Pengisian selesai/dihentikan.");
+        beepBuzzer(250, 1);
     }
 }
 
@@ -551,6 +563,10 @@ void handleDispenseStop() {
 }
 
 void handleResetBatch() {
+    if (valveOpen || isDispensing) {
+        server.send(400, "application/json", "{\"error\":\"Tidak dapat mereset saat cairan sedang mengalir! Hentikan pengisian terlebih dahulu.\"}");
+        return;
+    }
     noInterrupts();
     isrBatchPulses = 0;
     interrupts();
@@ -613,7 +629,12 @@ void handleSaveSettings() {
     if (doc["price"].is<float>()) pricePerLiter = doc["price"].as<float>();
     if (doc["k_factor"].is<float>()) {
         float newK = doc["k_factor"].as<float>();
-        if (newK > 0.0f) kFactor = newK;
+        if (newK > 0.0f) {
+            kFactor = newK;
+            kMid = newK;
+            kLow = newK * 0.99f;
+            kHigh = newK * 1.01f;
+        }
     }
     if (doc["overshoot"].is<float>()) {
         float ov = doc["overshoot"].as<float>();
@@ -662,6 +683,9 @@ void handleCalibrateBejana() {
 
     float newK = (float)pulses / targetVolume;
     kFactor = newK;
+    kMid = newK;
+    kLow = newK * 0.99f;
+    kHigh = newK * 1.01f;
     saveConfigToNVS();
 
     beepBuzzer(200, 2);
@@ -801,6 +825,10 @@ void handleWifiSettings() {
 }
 
 void handleNotFound() {
+    if (server.uri().startsWith("/api/")) {
+        server.send(404, "application/json", "{\"error\":\"Endpoint API tidak ditemukan\"}");
+        return;
+    }
     server.sendHeader("Location", String("http://") + AP_IP_ADDRESS, true);
     server.send(302, "text/plain", "");
 }
@@ -818,10 +846,10 @@ void setup() {
     // Setup GPIO
     pinMode(SENSOR_PIN, INPUT_PULLUP);
     pinMode(LED_FLOW_PIN, OUTPUT);
-    digitalWrite(LED_FLOW_PIN, LOW);
+    setFlowLed(false);
 
     pinMode(RELAY_VALVE_PIN, OUTPUT);
-    digitalWrite(RELAY_VALVE_PIN, LOW); // Solenoid valve initially closed
+    setValve(false); // Solenoid valve initially closed
 
     pinMode(BUZZER_PIN, OUTPUT);
     digitalWrite(BUZZER_PIN, LOW);
@@ -893,8 +921,7 @@ void setup() {
         if (upload.status == UPLOAD_FILE_START) {
             Serial.printf("[OTA] Update dimulai: %s\n", upload.filename.c_str());
             if (valveOpen) {
-                valveOpen = false;
-                digitalWrite(RELAY_VALVE_PIN, LOW);
+                setValve(false);
             }
             if (!Update.begin(UPDATE_SIZE_UNKNOWN)) {
                 Update.printError(Serial);
@@ -947,11 +974,11 @@ void loop() {
         if (pulses > 0) {
             lastPulseSeenMillis = currentMillis;
             isDispensing = true;
-            digitalWrite(LED_FLOW_PIN, HIGH);
+            setFlowLed(true);
         } else {
             if (currentMillis - lastPulseSeenMillis > 1200) {
                 isDispensing = false;
-                digitalWrite(LED_FLOW_PIN, LOW);
+                setFlowLed(false);
             }
         }
 
@@ -989,9 +1016,10 @@ void loop() {
                 }
             }
 
-            // SAFETY: Dry-Run Protection (Jika valve buka tapi tidak ada cairan > 6 detik)
-            if (currentMillis - dispenseStartTime >= DRY_RUN_TIMEOUT_MS) {
-                if (currentFlowRateLpm < 0.15f) {
+            // SAFETY: Dry-Run Protection (Jika valve buka tapi tidak ada aliran)
+            unsigned long dryTimeout = (activeDispenseMode == MODE_MANUAL) ? 20000 : 8000;
+            if (currentMillis - dispenseStartTime >= dryTimeout) {
+                if (currentFlowRateLpm < 0.15f && batchLiters < 0.05f) {
                     dryRunAlarm = true;
                     stopDispense(false, "dry_run");
                 }

@@ -625,6 +625,22 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
 
     <!-- Mini Metrics Grid -->
     <div class="metrics-grid">
+      <div class="stat-box" style="display:flex;flex-direction:column;align-items:center;justify-content:center;padding:8px 10px;">
+        <div class="stat-label">SPEEDOMETER DEBIT</div>
+        <svg viewBox="0 0 100 58" style="width:100%;max-width:120px;display:block;margin-top:2px;">
+          <defs>
+            <linearGradient id="gaugeGrad" x1="0%" y1="0%" x2="100%" y2="0%">
+              <stop offset="0%" stop-color="#0ea5e9" />
+              <stop offset="70%" stop-color="#10b981" />
+              <stop offset="100%" stop-color="#ef4444" />
+            </linearGradient>
+          </defs>
+          <path d="M 12 50 A 38 38 0 0 1 88 50" fill="none" stroke="#1e293b" stroke-width="8" stroke-linecap="round" />
+          <path id="gaugePath" d="M 12 50 A 38 38 0 0 1 88 50" fill="none" stroke="url(#gaugeGrad)" stroke-width="8" stroke-linecap="round" stroke-dasharray="119.4" stroke-dashoffset="119.4" style="transition: stroke-dashoffset 0.25s;" />
+          <text id="gaugeText" x="50" y="46" text-anchor="middle" font-size="12" font-weight="900" fill="#38bdf8">0.0</text>
+          <text x="50" y="55" text-anchor="middle" font-size="6" font-weight="700" fill="#64748b">LPM</text>
+        </svg>
+      </div>
       <div class="stat-box">
         <div class="stat-label">DEBIT ALIRAN</div>
         <div class="stat-val" style="color:#38bdf8;" id="flowRate">0.00 <span style="font-size:0.7rem;color:#64748b;">L/m</span></div>
@@ -1041,6 +1057,7 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
     let activeMode = "volume";
     let cachedHistory = [];
     let initialTimeSynced = false;
+    let settingsFormInitialized = false;
     let latestData = {};
 
     const PRESET_VOLUMES = [1, 2, 5, 10, 20, 50];
@@ -1168,6 +1185,38 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
         document.getElementById("overshootDisplay").innerHTML = `${Math.round((d.overshoot_liters || 0.02) * 1000)} <span style="font-size:0.7rem;color:#64748b;">mL</span>`;
         document.getElementById("liveKFactorLabel").textContent = `K: ${Number(d.effective_k || d.k_factor).toFixed(1)} pulsa/L`;
 
+        // Speedometer Gauge Update
+        const maxLpm = 30.0;
+        const lpmClamped = Math.min(Math.max(flowVal, 0), maxLpm);
+        const arcLength = 119.4;
+        const offset = arcLength - (lpmClamped / maxLpm) * arcLength;
+        const gaugeEl = document.getElementById("gaugePath");
+        if (gaugeEl) gaugeEl.style.strokeDashoffset = offset;
+        const gaugeTxt = document.getElementById("gaugeText");
+        if (gaugeTxt) gaugeTxt.textContent = flowVal.toFixed(1);
+
+        // Highlight Active Fluid Preset Button
+        if (d.active_fluid_id) {
+          document.querySelectorAll(".fluid-btn").forEach(b => {
+            b.classList.toggle("active", b.getAttribute("onclick")?.includes(d.active_fluid_id));
+          });
+        }
+
+        // Auto Populate Settings Form
+        if (!settingsFormInitialized) {
+          settingsFormInitialized = true;
+          if (document.getElementById("cfgFluidName")) document.getElementById("cfgFluidName").value = d.fluid_name || "";
+          if (document.getElementById("cfgPrice")) document.getElementById("cfgPrice").value = d.price_per_liter || 0;
+          if (document.getElementById("cfgKFactor")) document.getElementById("cfgKFactor").value = Number(d.k_factor || 400).toFixed(1);
+          if (document.getElementById("cfgOvershoot")) document.getElementById("cfgOvershoot").value = (d.overshoot_liters !== undefined) ? d.overshoot_liters : 0.02;
+          if (document.getElementById("cfgUnitName")) document.getElementById("cfgUnitName").value = d.unit_name || "Liter";
+          if (document.getElementById("cfgCurrency")) document.getElementById("cfgCurrency").value = d.currency || "Rp";
+          if (document.getElementById("cfgKLow") && d.k_low) document.getElementById("cfgKLow").value = Number(d.k_low).toFixed(1);
+          if (document.getElementById("cfgKMid") && d.k_mid) document.getElementById("cfgKMid").value = Number(d.k_mid).toFixed(1);
+          if (document.getElementById("cfgKHigh") && d.k_high) document.getElementById("cfgKHigh").value = Number(d.k_high).toFixed(1);
+          if (document.getElementById("cfgMpEnabled") && d.mp_enabled !== undefined) document.getElementById("cfgMpEnabled").checked = d.mp_enabled;
+        }
+
         // Wave animation toggle
         const waveEl = document.getElementById("flowWaveBar");
         if (d.is_dispensing || flowVal > 0.1) {
@@ -1200,7 +1249,8 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
           badge.className = "badge badge-valve-closed";
           badgeTxt.textContent = "VALVE TERTUTUP";
           document.getElementById("btnStart").disabled = false;
-          document.getElementById("btnStop").disabled = true;
+          // Enable stop button if flow is active or batch volume has been dispensed (supports manual nozzle mode)
+          document.getElementById("btnStop").disabled = (!d.is_dispensing && Number(d.batch_liters) <= 0.005);
         }
 
         // Alarm
