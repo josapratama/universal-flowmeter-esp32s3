@@ -1701,6 +1701,9 @@ void loop() {
             lastPulseSeenMillis = currentMillis;
             isDispensing = true;
             setFlowLed(true);
+            // Aliran terdeteksi secara fisik, otomatis reset alarm dry-run dan kebocoran
+            dryRunAlarm = false;
+            leakageAlert = false;
         } else {
             if (currentMillis - lastPulseSeenMillis > 1200) {
                 isDispensing = false;
@@ -1769,9 +1772,8 @@ void loop() {
                 }
             }
 
-            // SAFETY: Dry-Run Protection (Jika valve buka tapi tidak ada aliran)
-            unsigned long dryTimeout = (activeDispenseMode == MODE_MANUAL) ? 20000 : 8000;
-            if (currentMillis - dispenseStartTime >= dryTimeout) {
+            // SAFETY: Dry-Run Protection (Hanya aktif pada mode preset otomatis jika tidak ada aliran selama > 60 detik)
+            if (activeDispenseMode != MODE_MANUAL && (currentMillis - dispenseStartTime >= 60000)) {
                 if (currentFlowRateLpm < 0.15f && batchLiters < 0.05f) {
                     dryRunAlarm = true;
                     stopDispense(false, "dry_run");
