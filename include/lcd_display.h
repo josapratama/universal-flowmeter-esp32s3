@@ -78,7 +78,8 @@ public:
     }
 
     void update(float batchLiters, float batchCost, float flowRateLpm, bool valveOpen, bool isDispensing,
-                const String& fluid, float pricePerLiter, const String& ipStr, bool dryRun, bool leakage) {
+                const String& fluid, float pricePerLiter, const String& ipStr, bool dryRun, bool leakage,
+                bool tankLow = false, float tankRemaining = 0.0f) {
         if (!available || !lcd) return;
 
         unsigned long now = millis();
@@ -91,6 +92,8 @@ public:
             snprintf(row0, sizeof(row0), "** ALARM DRY RUN! **");
         } else if (leakage) {
             snprintf(row0, sizeof(row0), "** ALARM BOCOR!   **");
+        } else if (tankLow && ((now / 1000) % 2 == 0)) {
+            snprintf(row0, sizeof(row0), "** TANGKI MENIPIS **");
         } else {
             // Contoh: "SOLAR  Rp6.800/L    "
             String shortName = fluid.substring(0, 10);
@@ -111,13 +114,16 @@ public:
         printLine(2, row2);
 
         // Baris 3: Laju Debit Aliran (LPM) & Status Valve
-        // Contoh: "FLOW: 12.4 LPM [ON] " atau "IP: 192.168.4.1 [OFF]"
         char row3[21];
         const char* vStatus = valveOpen ? "[ON] " : (isDispensing ? "[FLO]" : "[OFF]");
         if (valveOpen || isDispensing || flowRateLpm > 0.05f) {
             snprintf(row3, sizeof(row3), "RATE:%5.1f LPM %s", flowRateLpm, vStatus);
         } else {
-            snprintf(row3, sizeof(row3), "IP:%-12s%s", ipStr.substring(0, 12).c_str(), vStatus);
+            if (tankRemaining > 0.0f) {
+                snprintf(row3, sizeof(row3), "TNK:%4.0fL %-6s%s", tankRemaining, ipStr.substring(0, 6).c_str(), vStatus);
+            } else {
+                snprintf(row3, sizeof(row3), "IP:%-12s%s", ipStr.substring(0, 12).c_str(), vStatus);
+            }
         }
         printLine(3, row3);
     }

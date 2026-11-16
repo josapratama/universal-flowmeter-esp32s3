@@ -747,7 +747,37 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
       </div>
     </div>
 
-    <!-- Auto Cut-off Control Station -->
+    <!-- Smart Tank Inventory Card -->
+    <div class="summary-card" style="margin-top:10px;border-color:rgba(14,165,233,0.3);background:linear-gradient(180deg, #131b2e, #0c1220);">
+      <div class="summary-header">
+        <span style="display:flex;align-items:center;gap:6px;font-weight:700;color:#38bdf8;">
+          🛢️ STOK TANGKI UTAMA (<span id="tankFluidName">-</span>)
+        </span>
+        <div style="display:flex;gap:6px;align-items:center;">
+          <span id="tankLowBadge" class="badge" style="display:none;background:rgba(239,68,68,0.2);color:#ef4444;border:1px solid rgba(239,68,68,0.4);font-size:0.7rem;padding:2px 6px;border-radius:4px;">
+            ⚠️ TANGKI MENIPIS
+          </span>
+          <button class="btn-secondary" style="padding:2px 8px;font-size:0.7rem;color:#10b981;border-color:rgba(16,185,129,0.3);" onclick="openTankRefillModal()">
+            ➕ Isi Ulang Tangki
+          </button>
+        </div>
+      </div>
+      <div style="display:flex;justify-content:space-between;align-items:baseline;margin:8px 0 4px;">
+        <div>
+          <span style="font-size:1.4rem;font-weight:800;color:#38bdf8;" id="tankRemainingVal">0</span>
+          <span style="font-size:0.85rem;color:#64748b;"> / <span id="tankCapacityVal">1000</span> L</span>
+        </div>
+        <div style="font-size:1.1rem;font-weight:700;color:#10b981;" id="tankPercentVal">0%</div>
+      </div>
+      <!-- Progress Bar Tangki -->
+      <div style="width:100%;height:10px;background:#1e293b;border-radius:6px;overflow:hidden;border:1px solid #334155;">
+        <div id="tankProgressBar" style="width:0%;height:100%;background:linear-gradient(90deg, #10b981, #0ea5e9);border-radius:6px;transition:width 0.4s ease;"></div>
+      </div>
+      <div style="display:flex;justify-content:space-between;font-size:0.72rem;color:#64748b;margin-top:6px;">
+        <span>Batas Alarm Rendah: <b id="tankLowAlertVal" style="color:#f59e0b;">100 L</b></span>
+        <span id="twoStageBadge" style="color:#a855f7;font-weight:600;">⚡ Katup 2-Tahap: Standby</span>
+      </div>
+    </div>
     <div class="control-card">
       <div class="control-header">
         <div class="control-title">
@@ -1027,6 +1057,45 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
           </div>
 
           <hr style="border:none;border-top:1px dashed #334155;margin:18px 0;" />
+          <h4 style="font-size:0.95rem;color:#10b981;margin-bottom:6px;">📡 MQTT Telemetry & Home Assistant Auto-Discovery</h4>
+          <p style="font-size:0.8rem;color:var(--text-muted);margin-bottom:12px;">
+            Kirim telemetri debit & volume real-time ke MQTT Broker / Home Assistant. Auto-discovery sensor aktif secara otomatis.
+          </p>
+          <div class="form-group" style="margin-bottom:10px;">
+            <label style="display:inline-flex;align-items:center;gap:8px;cursor:pointer;font-size:0.85rem;">
+              <input type="checkbox" id="cfgMqttEnabled" style="width:18px;height:18px;" />
+              <span>Aktifkan MQTT Telemetry</span>
+            </label>
+          </div>
+          <div class="form-grid-2">
+            <div class="form-group">
+              <label>MQTT Broker Host / IP:</label>
+              <input type="text" class="form-input" id="cfgMqttHost" placeholder="192.168.100.184" />
+            </div>
+            <div class="form-group">
+              <label>Port MQTT (Default: 1883):</label>
+              <input type="number" class="form-input" id="cfgMqttPort" placeholder="1883" />
+            </div>
+          </div>
+          <div class="form-grid-2">
+            <div class="form-group">
+              <label>Username (Opsional):</label>
+              <input type="text" class="form-input" id="cfgMqttUser" placeholder="admin" />
+            </div>
+            <div class="form-group">
+              <label>Password (Opsional):</label>
+              <input type="password" class="form-input" id="cfgMqttPass" placeholder="password" />
+            </div>
+          </div>
+          <div class="form-group">
+            <label>Topik MQTT Telemetri:</label>
+            <input type="text" class="form-input" id="cfgMqttTopic" placeholder="flowmeter/telemetry" />
+          </div>
+          <button class="btn-secondary" style="color:#10b981;border-color:rgba(16,185,129,0.4);width:100%;margin-top:6px;padding:10px;" onclick="saveMqttSettings()">
+            💾 Simpan Pengaturan MQTT
+          </button>
+
+          <hr style="border:none;border-top:1px dashed #334155;margin:18px 0;" />
           <h4 style="font-size:0.95rem;color:#38bdf8;margin-bottom:6px;">💾 Backup & Restore Konfigurasi (.json)</h4>
           <p style="font-size:0.8rem;color:var(--text-muted);margin-bottom:12px;">
             Simpan salinan cadangan parameter kalibrasi, harga, WiFi, dan profil cairan ke file JSON di komputer / HP Anda, atau pulihkan kembali dengan 1 klik.
@@ -1113,7 +1182,34 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
         </div>
         <div class="receipt-actions">
           <button class="btn-start" style="flex:1;padding:8px;" onclick="window.print()">🖨️ Cetak</button>
+          <button class="btn-secondary" style="background:#4338ca;color:#fff;border-color:#6366f1;padding:8px 12px;" onclick="printDirectSerialReceipt()">🖨️ Thermal (Serial)</button>
           <button class="btn-secondary" style="padding:8px 14px;" onclick="closeReceiptModal()">Tutup</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Modal Isi Ulang Tangki -->
+    <div class="modal-overlay" id="tankModal" style="display:none;">
+      <div class="receipt-box" style="max-width:380px;background:var(--card-bg);border:1px solid var(--card-border);color:var(--text);border-radius:14px;padding:16px;">
+        <h3 style="color:#38bdf8;margin-bottom:6px;font-size:1.05rem;">🛢️ Isi Ulang Stok Tangki</h3>
+        <p style="font-size:0.8rem;color:var(--text-muted);margin-bottom:12px;">
+          Tambah volume liter setelah pengisian pasokan tangki baru atau setel total stok saat ini.
+        </p>
+        <div class="form-group" style="margin-bottom:10px;">
+          <label style="font-size:0.75rem;color:var(--text-muted);display:block;margin-bottom:4px;">Tambah Stok Baru (Liter):</label>
+          <input type="number" step="1" class="form-input" id="tankRefillAdd" placeholder="Contoh: 500" style="width:100%;" />
+        </div>
+        <div class="form-group" style="margin-bottom:10px;">
+          <label style="font-size:0.75rem;color:var(--text-muted);display:block;margin-bottom:4px;">Atau Setel Sisa Stok Langsung (Liter):</label>
+          <input type="number" step="1" class="form-input" id="tankRefSet" placeholder="Contoh: 1000" style="width:100%;" />
+        </div>
+        <div class="form-group" style="margin-bottom:14px;">
+          <label style="font-size:0.75rem;color:var(--text-muted);display:block;margin-bottom:4px;">PIN Admin (Default: 1234):</label>
+          <input type="password" class="form-input" id="tankPin" placeholder="1234" style="width:100%;" />
+        </div>
+        <div style="display:flex;gap:8px;">
+          <button class="btn-start" style="flex:1;padding:10px;" onclick="submitTankRefill()">💾 Simpan Stok</button>
+          <button class="btn-secondary" style="padding:10px 14px;" onclick="closeTankRefillModal()">Batal</button>
         </div>
       </div>
     </div>
@@ -1472,6 +1568,59 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
           document.getElementById("wifiStatusText").textContent = `LAN: ${d.sta_ip}`;
         } else {
           document.getElementById("wifiStatusText").textContent = `AP: ${d.ap_ip}`;
+        }
+
+        // Smart Tank Inventory UI Update
+        if (d.tank_remaining !== undefined) {
+          const remEl = document.getElementById("tankRemainingVal");
+          if (remEl) remEl.textContent = Number(d.tank_remaining).toFixed(1);
+          const capEl = document.getElementById("tankCapacityVal");
+          if (capEl) capEl.textContent = Number(d.tank_capacity || 1000).toFixed(0);
+          const pct = Math.min(100, Math.max(0, Number(d.tank_percentage || 0)));
+          const pctEl = document.getElementById("tankPercentVal");
+          if (pctEl) pctEl.textContent = `${pct.toFixed(0)}%`;
+          const bar = document.getElementById("tankProgressBar");
+          if (bar) {
+            bar.style.width = `${pct}%`;
+            if (pct < 15) bar.style.background = "#ef4444";
+            else if (pct < 30) bar.style.background = "#f59e0b";
+            else bar.style.background = "linear-gradient(90deg, #10b981, #0ea5e9)";
+          }
+          const flEl = document.getElementById("tankFluidName");
+          if (flEl) flEl.textContent = d.fluid_name || "-";
+          const altEl = document.getElementById("tankLowAlertVal");
+          if (altEl) altEl.textContent = `${Number(d.tank_low_alert || 100).toFixed(0)} L`;
+          const lowBadge = document.getElementById("tankLowBadge");
+          if (lowBadge) lowBadge.style.display = d.tank_low_alarm ? "inline-block" : "none";
+        }
+
+        // Two-Stage Valve Status
+        const twoStageEl = document.getElementById("twoStageBadge");
+        if (twoStageEl) {
+          if (d.two_stage_enabled) {
+            if (d.valve_slow_open && !d.valve_fast_open) {
+              twoStageEl.textContent = "⚡ Katup: Inching Flow Aktif (Katup Lambat)";
+              twoStageEl.style.color = "#f59e0b";
+            } else if (d.valve_fast_open) {
+              twoStageEl.textContent = "⚡ Katup: Aliran Penuh 100% Aktif";
+              twoStageEl.style.color = "#10b981";
+            } else {
+              twoStageEl.textContent = `⚡ Katup 2-Tahap Siap (Inching ${d.slow_stage_liters || 0.25} L)`;
+              twoStageEl.style.color = "#a855f7";
+            }
+          } else {
+            twoStageEl.textContent = "Katup: Mode Standar 1-Tahap";
+            twoStageEl.style.color = "#64748b";
+          }
+        }
+
+        // MQTT form population
+        if (settingsFormInitialized && !window.mqttFormPopulated) {
+          window.mqttFormPopulated = true;
+          if (document.getElementById("cfgMqttEnabled")) document.getElementById("cfgMqttEnabled").checked = Boolean(d.mqtt_enabled);
+          if (document.getElementById("cfgMqttHost") && d.mqtt_broker) document.getElementById("cfgMqttHost").value = d.mqtt_broker;
+          if (document.getElementById("cfgMqttPort") && d.mqtt_port) document.getElementById("cfgMqttPort").value = d.mqtt_port;
+          if (document.getElementById("cfgMqttTopic") && d.mqtt_topic) document.getElementById("cfgMqttTopic").value = d.mqtt_topic;
         }
 
       } catch (err) {
@@ -1840,6 +1989,84 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
       };
       reader.readAsText(file);
       event.target.value = "";
+    }
+
+    function openTankRefillModal() {
+      document.getElementById("tankModal").style.display = "flex";
+    }
+
+    function closeTankRefillModal() {
+      document.getElementById("tankModal").style.display = "none";
+    }
+
+    async function submitTankRefill() {
+      const addVal = parseFloat(document.getElementById("tankRefillAdd").value);
+      const setVal = parseFloat(document.getElementById("tankRefSet").value);
+      const pinVal = document.getElementById("tankPin").value || "1234";
+
+      const payload = { pin: pinVal };
+      if (!isNaN(addVal) && addVal > 0) {
+        payload.added_liters = addVal;
+      } else if (!isNaN(setVal) && setVal >= 0) {
+        payload.set_remaining = setVal;
+      } else {
+        alert("Masukkan jumlah liter yang valid!");
+        return;
+      }
+
+      try {
+        const res = await fetch("/api/tank/refill", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(payload)
+        });
+        const data = await res.json();
+        alert(data.message || "Stok tangki diperbarui");
+        closeTankRefillModal();
+        fetchData();
+      } catch (err) {
+        alert("Gagal memperbarui stok: " + err);
+      }
+    }
+
+    async function saveMqttSettings() {
+      const payload = {
+        enabled: document.getElementById("cfgMqttEnabled").checked,
+        broker: document.getElementById("cfgMqttHost").value.trim(),
+        port: parseInt(document.getElementById("cfgMqttPort").value) || 1883,
+        user: document.getElementById("cfgMqttUser").value.trim(),
+        pass: document.getElementById("cfgMqttPass").value,
+        topic: document.getElementById("cfgMqttTopic").value.trim(),
+        pin: document.getElementById("staPin").value || "1234"
+      };
+
+      try {
+        const res = await fetch("/api/mqtt/settings", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(payload)
+        });
+        const data = await res.json();
+        alert(data.message || "Pengaturan MQTT berhasil disimpan!");
+      } catch (err) {
+        alert("Gagal menyimpan MQTT: " + err);
+      }
+    }
+
+    async function printDirectSerialReceipt() {
+      try {
+        const idText = document.getElementById("receiptId").textContent;
+        const id = parseInt(idText.replace("#", "").trim()) || 0;
+        const res = await fetch("/api/print/serial", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ id: id })
+        });
+        const data = await res.json();
+        alert(data.message || "Struk berhasil dikirim ke printer");
+      } catch (err) {
+        alert("Gagal print serial: " + err);
+      }
     }
 
     // Init

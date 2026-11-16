@@ -11,24 +11,67 @@
 #define SENSOR_PIN              4  // Signal Pulsa AICHI (Pull-up 4.7k-10k ke 3.3V)
 #define LED_FLOW_PIN            8  // Built-in Blue LED ESP32-C3 Super Mini
 #define LED_ACTIVE_LEVEL        LOW // LED SuperMini aktif LOW (katoda terhubung ke GPIO 8)
-#define RELAY_VALVE_PIN         6  // Relay Selenoid Valve
+#define RELAY_VALVE_PIN         6  // Relay Selenoid Valve (Katup Aliran Utama 100%)
+#define RELAY_VALVE_SLOW_PIN    10 // Relay Selenoid Valve (Katup Inching/Aliran Pelan 20%)
 #define BUZZER_PIN              7  // Buzzer Alarm
 #define I2C_SDA_PIN             2  // I2C SDA (OLED/LCD)
 #define I2C_SCL_PIN             3  // I2C SCL (OLED/LCD)
+#define THERMAL_SENSOR_PIN      5  // DS18B20 1-Wire Temperature Sensor (Opsional)
 #else
 // Pinout ESP32-S3 DevKitC-1 (N8R16)
 #define SENSOR_PIN              4
 #define LED_FLOW_PIN            2
 #define LED_ACTIVE_LEVEL        HIGH // LED ESP32-S3 aktif HIGH
-#define RELAY_VALVE_PIN         6
+#define RELAY_VALVE_PIN         6  // Relay Selenoid Valve (Katup Aliran Utama 100%)
+#define RELAY_VALVE_SLOW_PIN    5  // Relay Selenoid Valve (Katup Inching/Aliran Pelan 20%)
 #define BUZZER_PIN              7
 #define I2C_SDA_PIN             8
 #define I2C_SCL_PIN             9
+#define THERMAL_SENSOR_PIN      18 // DS18B20 1-Wire Temperature Sensor (Opsional)
 #endif
 
 // Logika Polaritas Relay (HIGH = Active High, LOW = Active Low)
 #define RELAY_ACTIVE_LEVEL      HIGH
 #define RELAY_INACTIVE_LEVEL    LOW
+
+// ==========================================
+// TWO-STAGE VALVE CONTROL (INCHING FLOW)
+// ==========================================
+// Mode Katup 2-Tahap: Stage 1 = Aliran Utama 100%, Stage 2 = Aliran Pelan 20% saat mendekati target
+#define DEFAULT_TWO_STAGE_ENABLED       true
+#define DEFAULT_SLOW_STAGE_LITERS       0.25f // 250 mL sebelum target, matikan katup utama, buka katup pelan
+
+// ==========================================
+// SMART TANK INVENTORY (LEVEL MONITORING)
+// ==========================================
+#define DEFAULT_TANK_CAPACITY_L         1000.0f
+#define DEFAULT_TANK_REMAINING_L        850.0f
+#define DEFAULT_TANK_LOW_ALERT_L        100.0f
+
+// ==========================================
+// MQTT TELEMETRY & HOME ASSISTANT DISCOVERY
+// ==========================================
+#define DEFAULT_MQTT_ENABLED            false
+#define DEFAULT_MQTT_BROKER             "192.168.100.184"
+#define DEFAULT_MQTT_PORT               1883
+#define DEFAULT_MQTT_USER               ""
+#define DEFAULT_MQTT_PASS               ""
+#define DEFAULT_MQTT_TOPIC              "flowmeter/telemetry"
+#define DEFAULT_MQTT_CLIENT_ID          "aichi-flowmeter"
+
+// ==========================================
+// THERMAL EXPANSION COMPENSATION (15°C / 20°C)
+// ==========================================
+#define DEFAULT_TEMP_COMP_ENABLED       false
+#define DEFAULT_REFERENCE_TEMP_C        15.0f
+#define DEFAULT_THERMAL_EXP_COEFF       0.00095f // 0.095% per °C untuk Solar/Diesel (0.00125 untuk Bensin)
+
+// ==========================================
+// ESC/POS THERMAL RECEIPT PRINTER
+// ==========================================
+#define DEFAULT_STORE_NAME              "SPBU MINI PERTAMINI"
+#define DEFAULT_STORE_ADDRESS           "JL. RAYA UTAMA NO. 88"
+#define DEFAULT_STORE_FOOTER            "TERIMA KASIH - SEMOGA SELAMAT SAMPAI TUJUAN"
 
 // ==========================================
 // I2C LCD DISPLAY CONFIGURATION (20x4 / 16x2)

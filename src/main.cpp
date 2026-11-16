@@ -5,6 +5,7 @@
 #include <Preferences.h>
 #include <ArduinoJson.h>
 #include <HTTPClient.h>
+#include <PubSubClient.h>
 #include <Update.h>
 #include <time.h>
 #include <sys/time.h>
@@ -15,6 +16,69 @@
 #include "lcd_display.h"
 
 // ==========================================
+// NON-BLOCKING BUZZER STATE MACHINE
+// ==========================================
+class NonBlockingBuzzer {
+private:
+    uint8_t pin;
+    uint16_t onDuration;
+    uint16_t offDuration;
+    uint8_t totalBeeps;
+    uint8_t currentBeep;
+    bool active;
+    unsigned long lastTransition;
+
+public:
+    explicit NonBlockingBuzzer(uint8_t p)
+        : pin(p), onDuration(0), offDuration(0), totalBeeps(0), currentBeep(0), active(false), lastTransition(0) {}
+
+    void begin() {
+        pinMode(pin, OUTPUT);
+        digitalWrite(pin, LOW);
+    }
+
+    void beep(uint16_t durationMs, uint8_t count = 1, uint16_t pauseMs = 80) {
+        if (count == 0 || durationMs == 0) return;
+        onDuration = durationMs;
+        offDuration = pauseMs;
+        totalBeeps = count;
+        currentBeep = 0;
+        active = true;
+        digitalWrite(pin, HIGH);
+        lastTransition = millis();
+    }
+
+    void stop() {
+        totalBeeps = 0;
+        currentBeep = 0;
+        active = false;
+        digitalWrite(pin, LOW);
+    }
+
+    void update(unsigned long now) {
+        if (totalBeeps == 0) return;
+
+        if (active) {
+            if (now - lastTransition >= onDuration) {
+                digitalWrite(pin, LOW);
+                active = false;
+                lastTransition = now;
+                currentBeep++;
+                if (currentBeep >= totalBeeps) {
+                    totalBeeps = 0;
+                }
+            }
+        } else {
+            if (now - lastTransition >= offDuration) {
+                digitalWrite(pin, HIGH);
+                active = true;
+                lastTransition = now;
+            }
+        }
+    }
+};
+
+// ==========================================
 // GLOBALS & OBJECTS
 // ==========================================
 WebServer server(HTTP_PORT);
@@ -22,6 +86,10 @@ DNSServer dnsServer;
 Preferences preferences;
 TransactionHistoryManager historyManager;
 FlowMeterLcd flowLcd;
+NonBlockingBuzzer buzzer(BUZZER_PIN);
+
+WiFiClient espClient;
+PubSubClient mqttClient(espClient);
 
 // Status & Perhitungan Flow Meter
 volatile uint32_t isrPulseCount = 0;
@@ -57,9 +125,28 @@ float lastBatchLiters = 0.0f;
 float lastBatchCost = 0.0f;
 String lastBatchTimeStr = "-";
 uint32_t lastBatchId = 0;
+String lastBatchMode = "manual";
 
 // Inching / Overshoot Compensation (Pencegah over-dispensing)
 float overshootLiters = DEFAULT_OVERSHOOT_LITERS;
+
+// Two-Stage Valve Control (Fast Flow + Slow Inching Flow)
+bool twoStageEnabled = DEFAULT_TWO_STAGE_ENABLED;
+float slowStageLiters = DEFAULT_SLOW_STAGE_LITERS;
+bool valveFastOpen = false;
+bool valveSlowOpen = false;
+bool valveOpen = false;
+
+// Smart Tank Inventory Management
+float tankCapacityLiters = DEFAULT_TANK_CAPACITY_L;
+float tankRemainingLiters = DEFAULT_TANK_REMAINING_L;
+float tankLowAlertLiters = DEFAULT_TANK_LOW_ALERT_L;
+bool tankLowAlarm = false;
+
+// ESC/POS Thermal Receipt Store Info
+String storeName = DEFAULT_STORE_NAME;
+String storeAddress = DEFAULT_STORE_ADDRESS;
+String storeFooter = DEFAULT_STORE_FOOTER;
 
 // Webhook & Cloud Integration (Omni Agent Hub / IoT)
 String webhookUrl = "";
@@ -68,6 +155,18 @@ String webhookUrl = "";
 String staSsid = "";
 String staPassword = "";
 bool staConnected = false;
+
+// MQTT Telemetry & Home Assistant Auto-Discovery
+bool mqttEnabled = DEFAULT_MQTT_ENABLED;
+String mqttBroker = DEFAULT_MQTT_BROKER;
+uint16_t mqttPort = DEFAULT_MQTT_PORT;
+String mqttUser = DEFAULT_MQTT_USER;
+String mqttPass = DEFAULT_MQTT_PASS;
+String mqttTopic = DEFAULT_MQTT_TOPIC;
+String mqttClientId = DEFAULT_MQTT_CLIENT_ID;
+unsigned long lastMqttReconnect = 0;
+unsigned long lastMqttPublish = 0;
+bool mqttHaDiscoverySent = false;
 
 // Realtime Metrics
 float currentFlowRateLpm = 0.0f;
@@ -80,6 +179,7 @@ unsigned long lastPulseSeenMillis = 0;
 unsigned long lastNvsSaveMillis = 0;
 double lastSavedTotalLiters = 0.0;
 bool isDispensing = false;
+bool nvsDirty = false;
 
 // ==========================================
 // SAFETY ALERTS (Dry-Run & Leakage)
@@ -98,40 +198,45 @@ enum DispenseMode {
     MODE_PRESET_AMOUNT = 2
 };
 
-bool valveOpen = false;
 DispenseMode activeDispenseMode = MODE_MANUAL;
 float targetDispenseVolume = 0.0f;
 float targetDispenseAmount = 0.0f;
 unsigned long dispenseStartTime = 0;
 
-// Helper: Buzzer Beep
-void beepBuzzer(uint16_t durationMs, uint8_t count = 1) {
-    for (uint8_t i = 0; i < count; i++) {
-        digitalWrite(BUZZER_PIN, HIGH);
-        delay(durationMs);
-        digitalWrite(BUZZER_PIN, LOW);
-        if (count > 1 && i < count - 1) delay(80);
-    }
+// Helper: Non-blocking Buzzer Beep
+inline void beepBuzzer(uint16_t durationMs, uint8_t count = 1, uint16_t pauseMs = 80) {
+    buzzer.beep(durationMs, count, pauseMs);
 }
 
-// Helper: Valve & LED Control (Mendukung polaritas Active-HIGH & Active-LOW)
+// Helper: Two-Stage Valve Control
+void setValves(bool fast, bool slow) {
+    valveFastOpen = fast;
+    valveSlowOpen = slow;
+    valveOpen = (fast || slow);
+    digitalWrite(RELAY_VALVE_PIN, fast ? RELAY_ACTIVE_LEVEL : RELAY_INACTIVE_LEVEL);
+    digitalWrite(RELAY_VALVE_SLOW_PIN, slow ? RELAY_ACTIVE_LEVEL : RELAY_INACTIVE_LEVEL);
+}
+
 inline void setValve(bool open) {
-    valveOpen = open;
-    digitalWrite(RELAY_VALVE_PIN, open ? RELAY_ACTIVE_LEVEL : RELAY_INACTIVE_LEVEL);
+    if (open) {
+        setValves(true, true); // Buka kedua tahap katup saat pengisian normal dimulai
+    } else {
+        setValves(false, false);
+    }
 }
 
 inline void setFlowLed(bool on) {
     digitalWrite(LED_FLOW_PIN, on ? LED_ACTIVE_LEVEL : !LED_ACTIVE_LEVEL);
 }
 
-// Background Task: Kirim Webhook ke Omni Agent Hub / Cloud
+// Background Task: Kirim Webhook ke Omni Agent Hub / Cloud (Stack 8192 bytes aman untuk TLS)
 void sendWebhookTask(void* pvParameters) {
     String* payload = (String*)pvParameters;
     if (payload && webhookUrl.length() > 5) {
         HTTPClient http;
         http.begin(webhookUrl);
         http.addHeader("Content-Type", "application/json");
-        http.setTimeout(4000);
+        http.setTimeout(5000);
         int code = http.POST(*payload);
         Serial.printf("[WEBHOOK] Push ke %s: HTTP %d\n", webhookUrl.c_str(), code);
         http.end();
@@ -178,7 +283,6 @@ float getEffectiveKFactor(float lpm) {
     } else if (lpm >= CALIB_HIGH_LPM_LIMIT) {
         return kHigh;
     } else {
-        // Interpolasi linear halus antara titik Low (5 LPM) dan High (15 LPM)
         float factor = (lpm - CALIB_LOW_LPM_LIMIT) / (CALIB_HIGH_LPM_LIMIT - CALIB_LOW_LPM_LIMIT);
         return kLow + factor * (kHigh - kLow);
     }
@@ -229,16 +333,41 @@ void loadSettingsFromNVS() {
     kMid = preferences.getFloat("k_mid", DEFAULT_K_MID);
     kHigh = preferences.getFloat("k_high", DEFAULT_K_HIGH);
 
+    // Load Two-Stage Valve Settings
+    twoStageEnabled = preferences.getBool("two_stage_en", DEFAULT_TWO_STAGE_ENABLED);
+    slowStageLiters = preferences.getFloat("slow_liters", DEFAULT_SLOW_STAGE_LITERS);
+
+    // Load Smart Tank Inventory
+    tankCapacityLiters = preferences.getFloat("tank_cap", DEFAULT_TANK_CAPACITY_L);
+    tankRemainingLiters = preferences.getFloat("tank_rem", DEFAULT_TANK_REMAINING_L);
+    tankLowAlertLiters = preferences.getFloat("tank_alert", DEFAULT_TANK_LOW_ALERT_L);
+    tankLowAlarm = (tankRemainingLiters <= tankLowAlertLiters);
+
+    // Load ESC/POS Printer Store Info
+    storeName = preferences.getString("store_name", DEFAULT_STORE_NAME);
+    storeAddress = preferences.getString("store_addr", DEFAULT_STORE_ADDRESS);
+    storeFooter = preferences.getString("store_foot", DEFAULT_STORE_FOOTER);
+
+    // Load MQTT Settings
+    mqttEnabled = preferences.getBool("mqtt_en", DEFAULT_MQTT_ENABLED);
+    mqttBroker = preferences.getString("mqtt_host", DEFAULT_MQTT_BROKER);
+    mqttPort = preferences.getUShort("mqtt_port", DEFAULT_MQTT_PORT);
+    mqttUser = preferences.getString("mqtt_user", DEFAULT_MQTT_USER);
+    mqttPass = preferences.getString("mqtt_pass", DEFAULT_MQTT_PASS);
+    mqttTopic = preferences.getString("mqtt_topic", DEFAULT_MQTT_TOPIC);
+
     preferences.end();
 
     lastSavedTotalLiters = totalLiters;
-    Serial.printf("[NVS] Data dimuat: Cairan=%s, Total=%.2f %s, K=%.3f, Harga=%s %.0f, Shift=%.2f L, PIN=%s\n", 
+    nvsDirty = false;
+
+    Serial.printf("[NVS] Data dimuat: Cairan=%s, Total=%.2f %s, K=%.3f, Harga=%s %.0f, Tangki=%.1f/%.1f L\n", 
                   fluidName.c_str(), totalLiters, unitName.c_str(), kFactor, currencySymbol.c_str(), 
-                  pricePerLiter, shiftLiters, adminPin.c_str());
+                  pricePerLiter, tankRemainingLiters, tankCapacityLiters);
 }
 
 void saveTotalToNVS() {
-    if (abs(totalLiters - lastSavedTotalLiters) > 0.01) {
+    if (nvsDirty || abs(totalLiters - lastSavedTotalLiters) > 0.01) {
         preferences.begin("flowmeter", false);
         preferences.putDouble("total_l", totalLiters);
         preferences.putFloat("s_liters", shiftLiters);
@@ -248,9 +377,12 @@ void saveTotalToNVS() {
         preferences.putFloat("t_cost", todayCost);
         preferences.putUInt("t_count", todayTxCount);
         preferences.putString("t_date", todayDateStr);
+        preferences.putFloat("tank_rem", tankRemainingLiters);
         preferences.end();
+
         lastSavedTotalLiters = totalLiters;
-        Serial.printf("[NVS] Total akumulasi tersimpan: %.3f %s\n", totalLiters, unitName.c_str());
+        nvsDirty = false;
+        Serial.printf("[NVS] Total & Tangki tersimpan: %.3f %s (Sisa Tangki: %.1f L)\n", totalLiters, unitName.c_str(), tankRemainingLiters);
     }
 }
 
@@ -271,20 +403,259 @@ void saveConfigToNVS() {
     preferences.putFloat("k_low", kLow);
     preferences.putFloat("k_mid", kMid);
     preferences.putFloat("k_high", kHigh);
+    preferences.putBool("two_stage_en", twoStageEnabled);
+    preferences.putFloat("slow_liters", slowStageLiters);
+    preferences.putFloat("tank_cap", tankCapacityLiters);
+    preferences.putFloat("tank_rem", tankRemainingLiters);
+    preferences.putFloat("tank_alert", tankLowAlertLiters);
+    preferences.putString("store_name", storeName);
+    preferences.putString("store_addr", storeAddress);
+    preferences.putString("store_foot", storeFooter);
+    preferences.putBool("mqtt_en", mqttEnabled);
+    preferences.putString("mqtt_host", mqttBroker);
+    preferences.putUShort("mqtt_port", mqttPort);
+    preferences.putString("mqtt_user", mqttUser);
+    preferences.putString("mqtt_pass", mqttPass);
+    preferences.putString("mqtt_topic", mqttTopic);
     preferences.end();
-    Serial.println("[NVS] Konfigurasi profil cairan dan IoT berhasil disimpan.");
+
+    nvsDirty = false;
+    Serial.println("[NVS] Konfigurasi sistem tersimpan.");
+}
+
+// ==========================================
+// MQTT & HOME ASSISTANT DISCOVERY
+// ==========================================
+void setupMqtt() {
+    if (mqttBroker.length() > 0) {
+        mqttClient.setServer(mqttBroker.c_str(), mqttPort);
+        mqttClient.setBufferSize(1024);
+    }
+}
+
+void publishHaDiscovery() {
+    if (!mqttClient.connected()) return;
+
+    const char* devId = "flowmeter_aichi_esp32";
+    const char* devName = "Smart AICHI Flowmeter";
+    const char* devModel = "Universal Flowmeter S3/C3";
+    const char* devMfr = "OpenSource Hardware";
+
+    // Sensor 1: Debit Aliran (Flow Rate)
+    {
+        JsonDocument doc;
+        doc["name"] = "Debit Aliran";
+        doc["stat_t"] = mqttTopic;
+        doc["unit_of_meas"] = "L/min";
+        doc["val_tpl"] = "{{ value_json.flow_rate_lpm }}";
+        doc["uniq_id"] = "flowmeter_flow_rate";
+        JsonObject dev = doc["device"].to<JsonObject>();
+        dev["ids"] = devId;
+        dev["name"] = devName;
+        dev["mdl"] = devModel;
+        dev["mf"] = devMfr;
+        String p; serializeJson(doc, p);
+        mqttClient.publish("homeassistant/sensor/flowmeter/flow_rate/config", p.c_str(), true);
+    }
+
+    // Sensor 2: Volume Batch Pengisian
+    {
+        JsonDocument doc;
+        doc["name"] = "Volume Pengisian";
+        doc["stat_t"] = mqttTopic;
+        doc["unit_of_meas"] = "L";
+        doc["val_tpl"] = "{{ value_json.batch_liters }}";
+        doc["uniq_id"] = "flowmeter_batch_volume";
+        JsonObject dev = doc["device"].to<JsonObject>();
+        dev["ids"] = devId;
+        String p; serializeJson(doc, p);
+        mqttClient.publish("homeassistant/sensor/flowmeter/batch_volume/config", p.c_str(), true);
+    }
+
+    // Sensor 3: Total Akumulasi Odometer
+    {
+        JsonDocument doc;
+        doc["name"] = "Total Akumulasi";
+        doc["stat_t"] = mqttTopic;
+        doc["unit_of_meas"] = "L";
+        doc["stat_cla"] = "total_increasing";
+        doc["val_tpl"] = "{{ value_json.total_liters }}";
+        doc["uniq_id"] = "flowmeter_total_volume";
+        JsonObject dev = doc["device"].to<JsonObject>();
+        dev["ids"] = devId;
+        String p; serializeJson(doc, p);
+        mqttClient.publish("homeassistant/sensor/flowmeter/total_volume/config", p.c_str(), true);
+    }
+
+    // Sensor 4: Sisa Stok Tangki
+    {
+        JsonDocument doc;
+        doc["name"] = "Sisa Stok Tangki";
+        doc["stat_t"] = mqttTopic;
+        doc["unit_of_meas"] = "L";
+        doc["val_tpl"] = "{{ value_json.tank_remaining_liters }}";
+        doc["uniq_id"] = "flowmeter_tank_remaining";
+        JsonObject dev = doc["device"].to<JsonObject>();
+        dev["ids"] = devId;
+        String p; serializeJson(doc, p);
+        mqttClient.publish("homeassistant/sensor/flowmeter/tank_remaining/config", p.c_str(), true);
+    }
+
+    // Binary Sensor 5: Katup Terbuka (Valve Open)
+    {
+        JsonDocument doc;
+        doc["name"] = "Status Katup Selenoid";
+        doc["stat_t"] = mqttTopic;
+        doc["val_tpl"] = "{{ 'ON' if value_json.valve_open else 'OFF' }}";
+        doc["uniq_id"] = "flowmeter_valve_state";
+        JsonObject dev = doc["device"].to<JsonObject>();
+        dev["ids"] = devId;
+        String p; serializeJson(doc, p);
+        mqttClient.publish("homeassistant/binary_sensor/flowmeter/valve/config", p.c_str(), true);
+    }
+
+    mqttHaDiscoverySent = true;
+    Serial.println("[MQTT] Home Assistant MQTT Auto-Discovery berhasil dipublikasikan.");
+}
+
+void publishMqttTelemetry() {
+    if (!mqttClient.connected()) return;
+
+    JsonDocument doc;
+    doc["flow_rate_lpm"] = currentFlowRateLpm;
+    doc["batch_liters"] = batchLiters;
+    doc["batch_cost"] = batchCost;
+    doc["total_liters"] = totalLiters;
+    doc["tank_remaining_liters"] = tankRemainingLiters;
+    doc["tank_capacity_liters"] = tankCapacityLiters;
+    doc["tank_percentage"] = (tankCapacityLiters > 0.0f) ? ((tankRemainingLiters / tankCapacityLiters) * 100.0f) : 0.0f;
+    doc["tank_low"] = tankLowAlarm;
+    doc["is_dispensing"] = isDispensing;
+    doc["valve_open"] = valveOpen;
+    doc["valve_fast_open"] = valveFastOpen;
+    doc["valve_slow_open"] = valveSlowOpen;
+    doc["fluid"] = fluidName;
+    doc["price_per_liter"] = pricePerLiter;
+    doc["uptime_sec"] = (uint32_t)(millis() / 1000);
+
+    String payload;
+    serializeJson(doc, payload);
+    mqttClient.publish(mqttTopic.c_str(), payload.c_str());
+}
+
+void handleMqtt(unsigned long now) {
+    if (!mqttEnabled || !staConnected || mqttBroker.length() == 0) return;
+
+    if (!mqttClient.connected()) {
+        if (now - lastMqttReconnect >= 5000) {
+            lastMqttReconnect = now;
+            String clientId = mqttClientId + "-" + String((uint32_t)ESP.getEfuseMac(), HEX);
+            bool connected = false;
+            if (mqttUser.length() > 0) {
+                connected = mqttClient.connect(clientId.c_str(), mqttUser.c_str(), mqttPass.c_str());
+            } else {
+                connected = mqttClient.connect(clientId.c_str());
+            }
+
+            if (connected) {
+                Serial.printf("[MQTT] Terhubung ke Broker %s:%u\n", mqttBroker.c_str(), mqttPort);
+                if (!mqttHaDiscoverySent) {
+                    publishHaDiscovery();
+                }
+                publishMqttTelemetry();
+            }
+        }
+    } else {
+        mqttClient.loop();
+        unsigned long interval = isDispensing ? 1000 : 10000;
+        if (now - lastMqttPublish >= interval) {
+            lastMqttPublish = now;
+            publishMqttTelemetry();
+        }
+    }
+}
+
+// ==========================================
+// ESC/POS THERMAL RECEIPT PRINTER GENERATOR
+// ==========================================
+String generateEscPosReceipt(uint32_t id, const String& timeStr, const String& fluid, float vol, float price, float cost, const String& mode) {
+    String esc = "";
+    esc += "\x1B\x40";       // Initialize printer
+    esc += "\x1B\x61\x01";   // Center align
+    esc += "\x1B\x45\x01";   // Bold ON
+    esc += storeName + "\n";
+    esc += "\x1B\x45\x00";   // Bold OFF
+    esc += storeAddress + "\n";
+    esc += "--------------------------------\n";
+    esc += "STRUK BUKTI PENGISIAN BBM\n";
+    esc += "--------------------------------\n";
+    esc += "\x1B\x61\x00";   // Left align
+
+    char buf[64];
+    snprintf(buf, sizeof(buf), "No. Trx : #%05u\n", (unsigned int)id);
+    esc += buf;
+    snprintf(buf, sizeof(buf), "Waktu   : %s\n", timeStr.c_str());
+    esc += buf;
+    snprintf(buf, sizeof(buf), "Produk  : %s\n", fluid.c_str());
+    esc += buf;
+    snprintf(buf, sizeof(buf), "Harga/L : Rp %.0f\n", price);
+    esc += buf;
+    snprintf(buf, sizeof(buf), "Mode    : %s\n", mode.c_str());
+    esc += buf;
+    esc += "--------------------------------\n";
+
+    esc += "\x1B\x45\x01";   // Bold
+    snprintf(buf, sizeof(buf), "VOLUME  : %.3f L\n", vol);
+    esc += buf;
+    snprintf(buf, sizeof(buf), "TOTAL   : Rp %.0f\n", cost);
+    esc += buf;
+    esc += "\x1B\x45\x00";   // Bold OFF
+
+    esc += "--------------------------------\n";
+    esc += "\x1B\x61\x01";   // Center align
+    esc += storeFooter + "\n";
+    esc += "Simpan struk ini sbg bukti sah\n";
+    esc += "\n\n\n";
+    esc += "\x1D\x56\x41\x03"; // Cut paper
+    return esc;
+}
+
+String generateTextReceipt(uint32_t id, const String& timeStr, const String& fluid, float vol, float price, float cost, const String& mode) {
+    String txt = "";
+    txt += "================================\n";
+    txt += "       " + storeName + "\n";
+    txt += "    " + storeAddress + "\n";
+    txt += "================================\n";
+    char buf[64];
+    snprintf(buf, sizeof(buf), "No. Trx : #%05u\n", (unsigned int)id);
+    txt += buf;
+    snprintf(buf, sizeof(buf), "Waktu   : %s\n", timeStr.c_str());
+    txt += buf;
+    snprintf(buf, sizeof(buf), "Produk  : %s\n", fluid.c_str());
+    txt += buf;
+    snprintf(buf, sizeof(buf), "Harga/L : Rp %.0f\n", price);
+    txt += buf;
+    snprintf(buf, sizeof(buf), "Mode    : %s\n", mode.c_str());
+    txt += buf;
+    txt += "--------------------------------\n";
+    snprintf(buf, sizeof(buf), "VOLUME  : %.3f Liter\n", vol);
+    txt += buf;
+    snprintf(buf, sizeof(buf), "TOTAL   : Rp %.0f\n", cost);
+    txt += buf;
+    txt += "================================\n";
+    txt += "  " + storeFooter + "\n";
+    txt += "================================\n";
+    return txt;
 }
 
 // ==========================================
 // DISPENSE CONTROL LOGIC
 // ==========================================
 void startDispense(DispenseMode mode, float target) {
-    // Reset alarm sebelum mulai
     dryRunAlarm = false;
     leakageAlert = false;
     idlePulseAccumulator = 0;
 
-    // Reset batch pulses for clean start
     noInterrupts();
     isrBatchPulses = 0;
     interrupts();
@@ -346,6 +717,7 @@ void stopDispense(bool autoCutoff = false, const char* stopReason = "normal") {
         lastBatchCost = batchCost;
         lastBatchTimeStr = getFormattedCurrentTime();
         lastBatchId = historyManager.getCount() + 1;
+        lastBatchMode = modeStr;
 
         // Record to History Log
         historyManager.addTransaction(
@@ -357,7 +729,7 @@ void stopDispense(bool autoCutoff = false, const char* stopReason = "normal") {
             modeStr
         );
 
-        // Async Webhook trigger ke Omni Agent Hub / VPS
+        // Async Webhook trigger ke Omni Agent Hub / VPS (Stack 8192)
         if (webhookUrl.length() > 5 && staConnected) {
             JsonDocument wDoc;
             wDoc["event"] = autoCutoff ? "DISPENSE_AUTO_CUTOFF" : "DISPENSE_STOPPED";
@@ -370,20 +742,22 @@ void stopDispense(bool autoCutoff = false, const char* stopReason = "normal") {
             wDoc["price_per_unit"] = pricePerLiter;
             wDoc["mode"] = modeStr;
             wDoc["total_odometer"] = totalLiters;
+            wDoc["tank_remaining"] = tankRemainingLiters;
             wDoc["timestamp_epoch"] = (uint32_t)time(nullptr);
             wDoc["time_str"] = getFormattedCurrentTime();
 
             String* payloadStr = new String();
             serializeJson(wDoc, *payloadStr);
-            xTaskCreate(sendWebhookTask, "WebhookTask", 4096, (void*)payloadStr, 1, NULL);
+            xTaskCreate(sendWebhookTask, "WebhookTask", 8192, (void*)payloadStr, 1, NULL);
         }
 
         saveTotalToNVS();
+        publishMqttTelemetry();
     }
 
     if (autoCutoff) {
         Serial.println("[DISPENSE] TARGET TERCAPAI! Auto Cut-off Solenoid Valve aktif.");
-        beepBuzzer(150, 3); // 3 beeps on auto-cutoff
+        beepBuzzer(150, 3);
     } else if (strcmp(stopReason, "dry_run") == 0) {
         Serial.println("[DISPENSE] DRY RUN ALARM! Pompa kosong / tidak ada aliran.");
         beepBuzzer(500, 2);
@@ -414,6 +788,8 @@ void handleApiData() {
     doc["price_per_liter"] = pricePerLiter;
     doc["is_dispensing"] = isDispensing;
     doc["valve_open"] = valveOpen;
+    doc["valve_fast_open"] = valveFastOpen;
+    doc["valve_slow_open"] = valveSlowOpen;
     doc["dispense_mode"] = (int)activeDispenseMode;
     doc["target_volume"] = targetDispenseVolume;
     doc["target_amount"] = targetDispenseAmount;
@@ -428,6 +804,24 @@ void handleApiData() {
     doc["leakage_alert"] = leakageAlert;
     doc["webhook_url"] = webhookUrl;
     doc["active_fluid_id"] = activeFluidId;
+
+    // Two-Stage Valve
+    doc["two_stage_enabled"] = twoStageEnabled;
+    doc["slow_stage_liters"] = slowStageLiters;
+
+    // Smart Tank Inventory
+    doc["tank_capacity"] = tankCapacityLiters;
+    doc["tank_remaining"] = tankRemainingLiters;
+    doc["tank_low_alert"] = tankLowAlertLiters;
+    doc["tank_percentage"] = (tankCapacityLiters > 0.0f) ? ((tankRemainingLiters / tankCapacityLiters) * 100.0f) : 0.0f;
+    doc["tank_low_alarm"] = tankLowAlarm;
+
+    // MQTT Telemetry Status
+    doc["mqtt_enabled"] = mqttEnabled;
+    doc["mqtt_connected"] = mqttClient.connected();
+    doc["mqtt_broker"] = mqttBroker;
+    doc["mqtt_port"] = mqttPort;
+    doc["mqtt_topic"] = mqttTopic;
 
     // Rekap Shift Operator
     doc["shift_liters"] = shiftLiters;
@@ -452,6 +846,9 @@ void handleApiData() {
     doc["last_cost"] = lastBatchCost;
     doc["last_time"] = lastBatchTimeStr;
     doc["last_id"] = lastBatchId;
+    doc["store_name"] = storeName;
+    doc["store_address"] = storeAddress;
+    doc["store_footer"] = storeFooter;
 
     String jsonResponse;
     serializeJson(doc, jsonResponse);
@@ -672,7 +1069,6 @@ void handleCalibrateBejana() {
     if (doc["actual_pulses"].is<uint32_t>()) {
         pulses = doc["actual_pulses"].as<uint32_t>();
     } else {
-        // Ambil dari batch saat ini
         noInterrupts();
         pulses = isrBatchPulses;
         interrupts();
@@ -705,6 +1101,219 @@ void handleCalibrateBejana() {
     server.send(200, "application/json", jsonResp);
 }
 
+// Smart Tank Endpoints
+void handleTankGet() {
+    JsonDocument doc;
+    doc["capacity"] = tankCapacityLiters;
+    doc["remaining"] = tankRemainingLiters;
+    doc["low_alert"] = tankLowAlertLiters;
+    doc["percentage"] = (tankCapacityLiters > 0.0f) ? ((tankRemainingLiters / tankCapacityLiters) * 100.0f) : 0.0f;
+    doc["is_low"] = tankLowAlarm;
+    String out;
+    serializeJson(doc, out);
+    server.send(200, "application/json", out);
+}
+
+void handleTankRefill() {
+    if (!server.hasArg("plain")) {
+        server.send(400, "application/json", "{\"error\":\"Payload kosong\"}");
+        return;
+    }
+    JsonDocument doc;
+    deserializeJson(doc, server.arg("plain"));
+
+    if (doc["added_liters"].is<float>()) {
+        float added = doc["added_liters"].as<float>();
+        tankRemainingLiters += added;
+        if (tankRemainingLiters > tankCapacityLiters) tankRemainingLiters = tankCapacityLiters;
+    } else if (doc["set_remaining"].is<float>()) {
+        tankRemainingLiters = doc["set_remaining"].as<float>();
+        if (tankRemainingLiters > tankCapacityLiters) tankRemainingLiters = tankCapacityLiters;
+    }
+
+    tankLowAlarm = (tankRemainingLiters <= tankLowAlertLiters);
+    nvsDirty = true;
+    saveTotalToNVS();
+    beepBuzzer(150, 2);
+
+    JsonDocument resp;
+    resp["status"] = "ok";
+    resp["remaining"] = tankRemainingLiters;
+    resp["capacity"] = tankCapacityLiters;
+    resp["message"] = "Stok tangki berhasil diperbarui";
+    String out;
+    serializeJson(resp, out);
+    server.send(200, "application/json", out);
+}
+
+void handleTankSettings() {
+    if (!server.hasArg("plain")) {
+        server.send(400, "application/json", "{\"error\":\"Payload kosong\"}");
+        return;
+    }
+    JsonDocument doc;
+    deserializeJson(doc, server.arg("plain"));
+    String pin = doc["pin"] | "";
+    if (pin != adminPin) {
+        server.send(403, "application/json", "{\"error\":\"PIN Admin salah!\"}");
+        return;
+    }
+
+    if (doc["capacity"].is<float>()) tankCapacityLiters = doc["capacity"].as<float>();
+    if (doc["low_alert"].is<float>()) tankLowAlertLiters = doc["low_alert"].as<float>();
+    if (doc["remaining"].is<float>()) tankRemainingLiters = doc["remaining"].as<float>();
+
+    tankLowAlarm = (tankRemainingLiters <= tankLowAlertLiters);
+    saveConfigToNVS();
+    beepBuzzer(150, 1);
+    server.send(200, "application/json", "{\"status\":\"ok\",\"message\":\"Pengaturan kapasitas tangki disimpan\"}");
+}
+
+// Two-Stage Valve Settings
+void handleValveSettings() {
+    if (!server.hasArg("plain")) {
+        server.send(400, "application/json", "{\"error\":\"Payload kosong\"}");
+        return;
+    }
+    JsonDocument doc;
+    deserializeJson(doc, server.arg("plain"));
+    String pin = doc["pin"] | "";
+    if (pin != adminPin) {
+        server.send(403, "application/json", "{\"error\":\"PIN Admin salah!\"}");
+        return;
+    }
+
+    if (doc["two_stage_enabled"].is<bool>()) twoStageEnabled = doc["two_stage_enabled"].as<bool>();
+    if (doc["slow_stage_liters"].is<float>()) slowStageLiters = doc["slow_stage_liters"].as<float>();
+
+    saveConfigToNVS();
+    beepBuzzer(150, 1);
+    server.send(200, "application/json", "{\"status\":\"ok\",\"message\":\"Pengaturan katup dua tahap disimpan\"}");
+}
+
+// MQTT Telemetry Settings
+void handleMqttSettings() {
+    if (!server.hasArg("plain")) {
+        server.send(400, "application/json", "{\"error\":\"Payload kosong\"}");
+        return;
+    }
+    JsonDocument doc;
+    deserializeJson(doc, server.arg("plain"));
+    String pin = doc["pin"] | "";
+    if (pin != adminPin) {
+        server.send(403, "application/json", "{\"error\":\"PIN Admin salah!\"}");
+        return;
+    }
+
+    if (doc["enabled"].is<bool>()) mqttEnabled = doc["enabled"].as<bool>();
+    if (doc["broker"].is<String>()) mqttBroker = doc["broker"].as<String>();
+    if (doc["port"].is<uint16_t>()) mqttPort = doc["port"].as<uint16_t>();
+    if (doc["user"].is<String>()) mqttUser = doc["user"].as<String>();
+    if (doc["pass"].is<String>()) mqttPass = doc["pass"].as<String>();
+    if (doc["topic"].is<String>()) mqttTopic = doc["topic"].as<String>();
+
+    saveConfigToNVS();
+    setupMqtt();
+    mqttHaDiscoverySent = false;
+    lastMqttReconnect = 0;
+
+    beepBuzzer(150, 1);
+    server.send(200, "application/json", "{\"status\":\"ok\",\"message\":\"Pengaturan MQTT disimpan\"}");
+}
+
+// Thermal Printer Receipt Handlers
+void handlePrintReceipt() {
+    uint32_t id = lastBatchId;
+    float vol = lastBatchLiters;
+    float cost = lastBatchCost;
+    float price = pricePerLiter;
+    String timeStr = lastBatchTimeStr;
+    String fluid = fluidName;
+    String mode = lastBatchMode;
+
+    if (server.hasArg("id")) {
+        uint32_t queryId = server.arg("id").toInt();
+        for (int i = 0; i < historyManager.getCount(); i++) {
+            const TransactionRecord* rec = historyManager.getRecord(i);
+            if (rec && rec->id == queryId) {
+                id = rec->id;
+                vol = rec->volume;
+                cost = rec->cost;
+                timeStr = rec->formattedTime;
+                fluid = rec->fluidName;
+                mode = rec->mode;
+                price = (vol > 0.001f) ? (cost / vol) : pricePerLiter;
+                break;
+            }
+        }
+    }
+
+    String format = server.hasArg("format") ? server.arg("format") : "escpos";
+    if (format == "text") {
+        String txt = generateTextReceipt(id, timeStr, fluid, vol, price, cost, mode);
+        server.send(200, "text/plain", txt);
+    } else {
+        String esc = generateEscPosReceipt(id, timeStr, fluid, vol, price, cost, mode);
+        server.sendHeader("Content-Disposition", "inline; filename=\"receipt_" + String(id) + ".bin\"");
+        server.send(200, "application/octet-stream", esc);
+    }
+}
+
+void handlePrintSerial() {
+    uint32_t id = lastBatchId;
+    float vol = lastBatchLiters;
+    float cost = lastBatchCost;
+    float price = pricePerLiter;
+    String timeStr = lastBatchTimeStr;
+    String fluid = fluidName;
+    String mode = lastBatchMode;
+
+    if (server.hasArg("id")) {
+        uint32_t queryId = server.arg("id").toInt();
+        for (int i = 0; i < historyManager.getCount(); i++) {
+            const TransactionRecord* rec = historyManager.getRecord(i);
+            if (rec && rec->id == queryId) {
+                id = rec->id;
+                vol = rec->volume;
+                cost = rec->cost;
+                timeStr = rec->formattedTime;
+                fluid = rec->fluidName;
+                mode = rec->mode;
+                price = (vol > 0.001f) ? (cost / vol) : pricePerLiter;
+                break;
+            }
+        }
+    }
+
+    String esc = generateEscPosReceipt(id, timeStr, fluid, vol, price, cost, mode);
+    Serial.print(esc); // Kirim stream binary ESC/POS langsung ke Hardware Serial
+
+    beepBuzzer(100, 2);
+    server.send(200, "application/json", "{\"status\":\"ok\",\"message\":\"Struk berhasil dikirim ke printer Serial\"}");
+}
+
+void handlePrintSettings() {
+    if (!server.hasArg("plain")) {
+        server.send(400, "application/json", "{\"error\":\"Payload kosong\"}");
+        return;
+    }
+    JsonDocument doc;
+    deserializeJson(doc, server.arg("plain"));
+    String pin = doc["pin"] | "";
+    if (pin != adminPin) {
+        server.send(403, "application/json", "{\"error\":\"PIN Admin salah!\"}");
+        return;
+    }
+
+    if (doc["store_name"].is<String>()) storeName = doc["store_name"].as<String>();
+    if (doc["store_address"].is<String>()) storeAddress = doc["store_address"].as<String>();
+    if (doc["store_footer"].is<String>()) storeFooter = doc["store_footer"].as<String>();
+
+    saveConfigToNVS();
+    beepBuzzer(150, 1);
+    server.send(200, "application/json", "{\"status\":\"ok\",\"message\":\"Pengaturan header & footer struk disimpan\"}");
+}
+
 // Sinkronisasi Waktu dari Browser Smartphone (Fallback Offline)
 void handleTimeSync() {
     if (!server.hasArg("plain")) {
@@ -719,7 +1328,7 @@ void handleTimeSync() {
         struct timeval tv = { (time_t)epoch, 0 };
         settimeofday(&tv, NULL);
         todayDateStr = getCurrentDateString();
-        Serial.printf("[TIME] Jam RTC berhasil disinkronkan dari browser: %s (%s)\n", getFormattedCurrentTime().c_str(), todayDateStr.c_str());
+        Serial.printf("[TIME] Jam RTC disinkronkan dari browser: %s (%s)\n", getFormattedCurrentTime().c_str(), todayDateStr.c_str());
         server.send(200, "application/json", "{\"status\":\"ok\",\"time\": \"" + getFormattedCurrentTime() + "\"}");
     } else {
         server.send(400, "application/json", "{\"error\":\"Timestamp epoch tidak valid\"}");
@@ -742,6 +1351,18 @@ void handleConfigBackup() {
     doc["k_low"] = kLow;
     doc["k_mid"] = kMid;
     doc["k_high"] = kHigh;
+    doc["two_stage_enabled"] = twoStageEnabled;
+    doc["slow_stage_liters"] = slowStageLiters;
+    doc["tank_capacity"] = tankCapacityLiters;
+    doc["tank_remaining"] = tankRemainingLiters;
+    doc["tank_low_alert"] = tankLowAlertLiters;
+    doc["store_name"] = storeName;
+    doc["store_address"] = storeAddress;
+    doc["store_footer"] = storeFooter;
+    doc["mqtt_enabled"] = mqttEnabled;
+    doc["mqtt_broker"] = mqttBroker;
+    doc["mqtt_port"] = mqttPort;
+    doc["mqtt_topic"] = mqttTopic;
     doc["backup_time"] = getFormattedCurrentTime();
 
     String out;
@@ -777,8 +1398,21 @@ void handleConfigRestore() {
     if (doc["k_low"].is<float>()) kLow = doc["k_low"].as<float>();
     if (doc["k_mid"].is<float>()) kMid = doc["k_mid"].as<float>();
     if (doc["k_high"].is<float>()) kHigh = doc["k_high"].as<float>();
+    if (doc["two_stage_enabled"].is<bool>()) twoStageEnabled = doc["two_stage_enabled"].as<bool>();
+    if (doc["slow_stage_liters"].is<float>()) slowStageLiters = doc["slow_stage_liters"].as<float>();
+    if (doc["tank_capacity"].is<float>()) tankCapacityLiters = doc["tank_capacity"].as<float>();
+    if (doc["tank_remaining"].is<float>()) tankRemainingLiters = doc["tank_remaining"].as<float>();
+    if (doc["tank_low_alert"].is<float>()) tankLowAlertLiters = doc["tank_low_alert"].as<float>();
+    if (doc["store_name"].is<String>()) storeName = doc["store_name"].as<String>();
+    if (doc["store_address"].is<String>()) storeAddress = doc["store_address"].as<String>();
+    if (doc["store_footer"].is<String>()) storeFooter = doc["store_footer"].as<String>();
+    if (doc["mqtt_enabled"].is<bool>()) mqttEnabled = doc["mqtt_enabled"].as<bool>();
+    if (doc["mqtt_broker"].is<String>()) mqttBroker = doc["mqtt_broker"].as<String>();
+    if (doc["mqtt_port"].is<uint16_t>()) mqttPort = doc["mqtt_port"].as<uint16_t>();
+    if (doc["mqtt_topic"].is<String>()) mqttTopic = doc["mqtt_topic"].as<String>();
 
     saveConfigToNVS();
+    setupMqtt();
     beepBuzzer(150, 2);
     server.send(200, "application/json", "{\"status\":\"ok\",\"message\":\"Konfigurasi berhasil dipulihkan (restored)!\"}");
 }
@@ -875,6 +1509,9 @@ void handleWifiSettings() {
 
     staSsid = doc["ssid"] | "";
     staPassword = doc["password"] | "";
+    if (doc["webhook"].is<String>()) {
+        webhookUrl = doc["webhook"].as<String>();
+    }
     saveConfigToNVS();
 
     server.send(200, "application/json", "{\"status\":\"ok\",\"message\":\"WiFi tersimpan, mencoba menghubungkan...\"}");
@@ -898,7 +1535,7 @@ void handleNotFound() {
 // ==========================================
 void setup() {
     Serial.begin(115200);
-    delay(1000);
+    delay(500);
     Serial.println("\n==============================================");
     Serial.println("  UNIVERSAL FLOW METER ESP32-S3 | SMART NVR");
     Serial.println("==============================================");
@@ -909,10 +1546,10 @@ void setup() {
     setFlowLed(false);
 
     pinMode(RELAY_VALVE_PIN, OUTPUT);
-    setValve(false); // Solenoid valve initially closed
+    pinMode(RELAY_VALVE_SLOW_PIN, OUTPUT);
+    setValves(false, false);
 
-    pinMode(BUZZER_PIN, OUTPUT);
-    digitalWrite(BUZZER_PIN, LOW);
+    buzzer.begin();
 
     // Inisialisasi Layar LCD 20x4 I2C (Deteksi Otomatis 0x27 / 0x3F)
     flowLcd.begin();
@@ -942,12 +1579,15 @@ void setup() {
 
     // 2. Setup Station mode jika SSID tersimpan
     if (staSsid.length() > 0) {
-        Serial.printf("[WIFI] Mencoba konek ke WiFi Rumah: %s\n", staSsid.c_str());
+        Serial.printf("[WIFI] Mencoba konek ke WiFi: %s\n", staSsid.c_str());
         WiFi.begin(staSsid.c_str(), staPassword.c_str());
     }
 
     // 3. Setup SNTP Time Synchronization (GMT+7 WIB)
     configTime(GMT_OFFSET_SEC, DAYLIGHT_OFFSET_SEC, NTP_SERVER_1, NTP_SERVER_2, NTP_SERVER_3);
+
+    // 4. Setup MQTT Client
+    setupMqtt();
 
     // DNS Server untuk Captive Portal
     dnsServer.start(53, "*", local_ip);
@@ -974,6 +1614,22 @@ void setup() {
     server.on("/api/wifi/settings", HTTP_POST, handleWifiSettings);
     server.on("/api/config/backup", HTTP_GET, handleConfigBackup);
     server.on("/api/config/restore", HTTP_POST, handleConfigRestore);
+
+    // Smart Tank Inventory Endpoints
+    server.on("/api/tank", HTTP_GET, handleTankGet);
+    server.on("/api/tank/refill", HTTP_POST, handleTankRefill);
+    server.on("/api/tank/settings", HTTP_POST, handleTankSettings);
+
+    // Two-Stage Valve Settings Endpoint
+    server.on("/api/valve/settings", HTTP_POST, handleValveSettings);
+
+    // MQTT Settings Endpoint
+    server.on("/api/mqtt/settings", HTTP_POST, handleMqttSettings);
+
+    // ESC/POS Thermal Receipt Printer Endpoints
+    server.on("/api/print/receipt", HTTP_GET, handlePrintReceipt);
+    server.on("/api/print/serial", HTTP_POST, handlePrintSerial);
+    server.on("/api/print/settings", HTTP_POST, handlePrintSettings);
 
     // Web OTA Firmware Update via Browser
     server.on("/update", HTTP_POST, []() {
@@ -1009,7 +1665,7 @@ void setup() {
     server.begin();
     Serial.println("[HTTP] Web Server aktif dan siap melayani permintaan.");
 
-    beepBuzzer(80, 2); // Startup sound
+    beepBuzzer(80, 2);
     lastCalcTime = millis();
 }
 
@@ -1022,8 +1678,14 @@ void loop() {
 
     unsigned long currentMillis = millis();
 
+    // Update non-blocking buzzer state
+    buzzer.update(currentMillis);
+
     // Check STA connection status
     staConnected = (WiFi.status() == WL_CONNECTED);
+
+    // Handle MQTT connection & telemetry
+    handleMqtt(currentMillis);
 
     // Perhitungan Debit & Volume setiap 300 ms (fast response)
     if (currentMillis - lastCalcTime >= 300) {
@@ -1033,7 +1695,6 @@ void loop() {
         noInterrupts();
         uint32_t pulses = isrPulseCount;
         isrPulseCount = 0;
-        uint32_t currentBatchPulses = isrBatchPulses;
         interrupts();
 
         if (pulses > 0) {
@@ -1047,37 +1708,64 @@ void loop() {
             }
         }
 
-        // Hitung debit aliran dinamis (Flow Rate Satuan / Menit)
+        // Hitung debit aliran dinamis (Flow Rate LPM)
         float effK = getEffectiveKFactor(currentFlowRateLpm);
         if (isDispensing && effK > 0.0f) {
             float volumeThisPeriod = (float)pulses / effK;
             currentFlowRateLpm = (volumeThisPeriod * 60000.0f) / (float)deltaMs;
             totalLiters += (double)volumeThisPeriod;
+            
+            // Akumulasi batch inkremental (bebas distorsi multi-point kalibrasi dinamis)
+            batchLiters += volumeThisPeriod;
+            batchCost = batchLiters * pricePerLiter;
+
+            // Pengurangan stok tangki secara real-time
+            if (tankRemainingLiters > volumeThisPeriod) {
+                tankRemainingLiters -= volumeThisPeriod;
+            } else {
+                tankRemainingLiters = 0.0f;
+            }
+            tankLowAlarm = (tankRemainingLiters <= tankLowAlertLiters);
+            nvsDirty = true;
         } else {
             currentFlowRateLpm = 0.0f;
         }
 
-        // Hitung volume batch dengan kalibrasi presisi
-        if (effK > 0.0f) {
-            batchLiters = (float)currentBatchPulses / effK;
-            batchCost = batchLiters * pricePerLiter;
-        }
-
         // ==========================================
-        // AUTO CUT-OFF EVALUATION (DENGAN OVERSHOOT COMPENSATION)
+        // AUTO CUT-OFF EVALUATION (TWO-STAGE INCHING & OVERSHOOT)
         // ==========================================
         if (valveOpen) {
-            // Hitung target efektif dengan kompensasi sisa inersia selang
             float effectiveCutoffVolume = targetDispenseVolume > overshootLiters ? (targetDispenseVolume - overshootLiters) : targetDispenseVolume;
             float effectiveCutoffCost = targetDispenseAmount > (overshootLiters * pricePerLiter) ? (targetDispenseAmount - (overshootLiters * pricePerLiter)) : targetDispenseAmount;
 
+            // Transisi Katup Tahap 2 (Inching / Slow-Flow):
+            // Matikan katup utama (fast) dan biarkan katup kecil (slow) menyala saat mendekati target
+            if (twoStageEnabled && valveFastOpen) {
+                if (activeDispenseMode == MODE_PRESET_VOLUME && targetDispenseVolume > (slowStageLiters * 1.5f)) {
+                    float remainingVol = targetDispenseVolume - batchLiters;
+                    if (remainingVol <= slowStageLiters) {
+                        valveFastOpen = false;
+                        digitalWrite(RELAY_VALVE_PIN, RELAY_INACTIVE_LEVEL);
+                        Serial.printf("[VALVE] Inching Stage Aktif! Sisa=%.3f L. Katup utama OFF, katup pelan ON.\n", remainingVol);
+                    }
+                } else if (activeDispenseMode == MODE_PRESET_AMOUNT && targetDispenseAmount > (slowStageLiters * pricePerLiter * 1.5f)) {
+                    float remainingCost = targetDispenseAmount - batchCost;
+                    if (remainingCost <= (slowStageLiters * pricePerLiter)) {
+                        valveFastOpen = false;
+                        digitalWrite(RELAY_VALVE_PIN, RELAY_INACTIVE_LEVEL);
+                        Serial.printf("[VALVE] Inching Stage Aktif! Sisa=Rp %.0f. Katup pelan ON.\n", remainingCost);
+                    }
+                }
+            }
+
+            // Evaluasi Auto Cut-off Akhir
             if (activeDispenseMode == MODE_PRESET_VOLUME && targetDispenseVolume > 0.0f) {
                 if (batchLiters >= effectiveCutoffVolume) {
-                    stopDispense(true, "auto_cutoff"); // Auto cut-off triggered!
+                    stopDispense(true, "auto_cutoff");
                 }
             } else if (activeDispenseMode == MODE_PRESET_AMOUNT && targetDispenseAmount > 0.0f) {
                 if (batchCost >= effectiveCutoffCost) {
-                    stopDispense(true, "auto_cutoff"); // Auto cut-off triggered!
+                    stopDispense(true, "auto_cutoff");
                 }
             }
 
@@ -1100,25 +1788,23 @@ void loop() {
         }
     }
 
-    // Safety Alarm Buzzer Beep
+    // Safety Alarm Buzzer Beep (Peringatan Non-blocking)
     if (dryRunAlarm || leakageAlert) {
         if (currentMillis - lastAlarmBeepMillis >= 1500) {
             lastAlarmBeepMillis = currentMillis;
-            digitalWrite(BUZZER_PIN, HIGH);
-            delay(40);
-            digitalWrite(BUZZER_PIN, LOW);
+            beepBuzzer(40, 1);
         }
     }
 
-    // Auto-save total akumulasi ke NVS per 10 detik saat tidak ada aliran
+    // Auto-save total akumulasi ke NVS per 10 detik dengan dirty flag (Wear-Leveling Protection)
     if (currentMillis - lastNvsSaveMillis >= NVS_AUTO_SAVE_INTERVAL) {
         lastNvsSaveMillis = currentMillis;
-        if (!isDispensing && !valveOpen) {
+        if (!isDispensing && !valveOpen && nvsDirty) {
             saveTotalToNVS();
         }
     }
 
     // Update Layar LCD 20x4 I2C Secara Real-Time (Tanpa Flicker)
     String activeDisplayIp = (staConnected && WiFi.localIP().toString() != "0.0.0.0") ? WiFi.localIP().toString() : AP_IP_ADDRESS;
-    flowLcd.update(batchLiters, batchCost, currentFlowRateLpm, valveOpen, isDispensing, fluidName, pricePerLiter, activeDisplayIp, dryRunAlarm, leakageAlert);
+    flowLcd.update(batchLiters, batchCost, currentFlowRateLpm, valveOpen, isDispensing, fluidName, pricePerLiter, activeDisplayIp, dryRunAlarm, leakageAlert, tankLowAlarm, tankRemainingLiters);
 }
