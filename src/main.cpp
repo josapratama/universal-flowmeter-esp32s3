@@ -1778,13 +1778,9 @@ void loop() {
                 }
             }
         } else {
-            // SAFETY: Deteksi Kebocoran Pipa (Jika valve tutup tapi pulsa terus masuk)
-            if (pulses > 0) {
-                idlePulseAccumulator += pulses;
-                if (idlePulseAccumulator >= LEAKAGE_THRESHOLD_PULSES) {
-                    leakageAlert = true;
-                }
-            }
+            // Dalam mode standalone tanpa valve / manual flowmeter, aliran bebas diizinkan
+            // Hanya picu alarm bocor jika mode preset aktif dan katup ditutup sengaja
+            idlePulseAccumulator = 0;
         }
     }
 
